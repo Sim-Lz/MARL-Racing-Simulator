@@ -13,7 +13,7 @@ class Team:
                 rewards[car.car_id] = -15.0  # Penalità forte per morte prematura
             else:
                 # Ricompensa proporzionale alla stabilità della velocità espressa
-                rewards[car.car_id] = car.speed * 1.5  
+                rewards[car.car_id] = car.speed * 1.05  #*1.5
         
         # Blending cooperativo dei canali di comunicazione (70% individuale, 30% alleato)
         if len(self.cars) == 2:
@@ -21,7 +21,7 @@ class Team:
             r1 = rewards[id1]
             r2 = rewards[id2]
             
-            rewards[id1] = 0.7 * r1 + 0.3 * r2
-            rewards[id2] = 0.7 * r2 + 0.3 * r1
+            rewards[id1] = 0.9 * r1 + 0.1 * r2
+            rewards[id2] = 0.9 * r2 + 0.1 * r1
             
         return rewards
