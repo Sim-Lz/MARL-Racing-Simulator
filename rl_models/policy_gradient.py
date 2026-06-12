@@ -20,12 +20,15 @@ class PolicyNetwork(nn.Module):
 class PolicyGradientAgent:
     def __init__(self):
         self.policy = PolicyNetwork()
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=0.002)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=0.001)
         self.saved_log_probs = []
         self.rewards = []
 
     def select_action(self, state_vector):
-        state_t = torch.FloatTensor(state_vector)
+        # Normalizzazione cruciale dell'input per impedire la saturazione della Softmax
+        norm_state = np.array(state_vector) / 250.0
+        state_t = torch.FloatTensor(norm_state)
+        
         probs = self.policy(state_t)
         m = Categorical(probs)
         action_idx = m.sample()
@@ -36,7 +39,6 @@ class PolicyGradientAgent:
         if not self.rewards:
             return
             
-        # Calcolo dei totali dei ritorni scontati (REINFORCE)
         R = 0
         policy_loss = []
         returns = []

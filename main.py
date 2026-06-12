@@ -537,4 +537,5 @@ while True:
 # 2.2) le auto che ruotano su sé stesse forse superano checkpoint andando contromano. per la singola auto l'unico checkpoint attivo da raggiungere è quello successivo e non quelli che dovranno superare dopo aver superato il successivo, altrimenti si rischia di avere auto che ruotano su se stesse per ore senza mai superare un checkpoint, ma solo avvicinandosi a quello più vicino (che però non è quello attivo da superare) e quindi accumulando reward per la distanza percorsa senza mai avanzare realmente nel tracciato.
 # 3) le vetture non sembrano superare le vetture avversarie, bensì, attraverso la scia, seguono la vettura precedente solo per poi finire contro di essa, terminando per essere entrambe eliminare
 # 4) vanno migliorati anche i singoli algoritmi per renderli più competitivi e meno propensi a rimanere bloccati in situazioni di stallo o rotazione su se stessi
-# 5) 
+# 5) l'effetto scia deve continuare anche mentre l'auto tenta il sorpasso e la percentuale di velocità deve diminuire come da resistenza dell'aria (effetto scia scompare lentamente)
+# 6) le auto che terminano la gara completando tutti i giri lo fanno prima della linea del traguardo
