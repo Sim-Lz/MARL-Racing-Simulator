@@ -15,7 +15,6 @@ class Car:
         self.y = float(start_pos[1])
         self.angle = float(start_angle)  
         
-        # Le auto partono completamente ferme da 0 px/s
         self.speed_px = 0.0  
         self.speed = 0.0
         
@@ -25,10 +24,19 @@ class Car:
         self.next_checkpoint = 0  
         self.sensor_distances = np.zeros(len(SENSOR_ANGLES))
 
-        # TRACKER STRUTTURALI PER RIGENERAZIONE E REWARDS
         self.last_lap_timer = 0.0
         self.lap_bonus_reward = 0.0
         self.crash_triggered = False
+        
+        # --- METRICHE DI VALUTAZIONE SCIENTIFICA E REWARD ---
+        self.max_speed_reached = 0.0
+        self.total_steps = 0
+        self.slipstream_frames = 0
+        self.overtakes_performed = 0
+        self.checkpoints_passed_total = 0
+        self.cumulative_reward = 0.0  # Problema 7: Tracciamento Gradiente/Reward Finale
+        
+        self.slipstream_timer = 0 
 
     def cast_rays(self, track):
         if not self.alive:
@@ -42,63 +50,68 @@ class Car:
             while distance < MAX_RAY_DISTANCE:
                 target_x = self.x + dx * distance
                 target_y = self.y + dy * distance
-                
                 if not track.get_pixel_safety(target_x, target_y):
                     break
                 distance += 2.0  
-                
             self.sensor_distances[i] = distance
 
     def update(self, action, track, has_slipstream=False):
         if not self.alive:
             return
+        
+        self.total_steps += 1
 
-        # 1. Applicazione dello sterzo dinamico (Sottosterzo ad alta velocità)
+        if has_slipstream:
+            self.slipstream_timer = 30  
+            self.slipstream_frames += 1
+        elif self.slipstream_timer > 0:
+            self.slipstream_timer -= 1
+
+        is_currently_boosted = (self.slipstream_timer > 0)
+        top_speed = MAX_SPEED_PX * 1.15 if is_currently_boosted else MAX_SPEED_PX
+        
+        # Problema 5: Incremento massiccio dell'accelerazione sotto effetto scia
+        current_accel = ACCELERATION * 1.25 if is_currently_boosted else ACCELERATION
+
         current_max_steer = MAX_STEER_ANGLE * (MIN_SPEED_PX / max(self.speed_px, MIN_SPEED_PX)) if self.speed_px > 0 else MAX_STEER_ANGLE
-
         if action == -1:
             self.angle -= current_max_steer
         elif action == 1:
             self.angle += current_max_steer
-            
         self.angle = self.angle % 360
 
-        # EFFETTO SCIA: Incremento della velocità massima
-        top_speed = MAX_SPEED_PX * 1.15 if has_slipstream else MAX_SPEED_PX
-
-        # --- NUOVO: SBLOCCO VELOCITÀ MASSIMA IN RETTILINEO ---
-        front_distance = min(self.sensor_distances[1:6])
+        # Problema 4: Analisi corretta del radar per la V-MAX
+        center_distance = self.sensor_distances[3]  # Solo il raggio 0°
         
-        # Se lo spazio davanti è superiore a 140 pixel (rettilineo chiaro), dai gas al massimo!
-        if front_distance > 140.0:
+        if center_distance > 140.0:
             target_speed = top_speed
         else:
-            # Se si avvicina una curva, decelera linearmente fino a una velocità minima di manovra (30 px/s)
-            safe_ratio = front_distance / 140.0
+            front_min = min(self.sensor_distances[2:5])
+            safe_ratio = front_min / 140.0
             target_speed = 30.0 + (top_speed - 30.0) * safe_ratio
         
         if action != 0:
-            target_speed *= 0.80  # Attrito da curvatura (Tire Scrub) per stabilizzare la traiettoria
+            target_speed *= 0.80  
             
         target_speed = max(15.0, min(target_speed, top_speed))
 
-        # 3. Simulazione dell'inerzia lineare (Accelerazione e Frenata)
+        # Inerzia lineare con accelerazione boostata
         if self.speed_px < target_speed:
-            self.speed_px = min(target_speed, self.speed_px + (ACCELERATION / FPS))
+            self.speed_px = min(target_speed, self.speed_px + (current_accel / FPS))
         elif self.speed_px > target_speed:
             self.speed_px = max(target_speed, self.speed_px - (DECELERATION / FPS))
 
         self.speed = self.speed_px / FPS
+        if self.speed_px > self.max_speed_reached:
+            self.max_speed_reached = self.speed_px
 
-        # 4. Spostamento cinematico vettoriale
         rad = math.radians(self.angle)
         self.x += math.cos(rad) * self.speed
         self.y += math.sin(rad) * self.speed
-        
         self.distance_traveled += self.speed
+        
         self.cast_rays(track)
         
-        # Validazione stato vitale
         if np.any(self.sensor_distances[:5] < CRASH_THRESHOLD) or not track.get_pixel_safety(self.x, self.y):
             self.alive = False
 

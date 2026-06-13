@@ -8,7 +8,7 @@ class Track:
         self.height = height
         self.surface = pygame.Surface((width, height))
         self.surface.fill((0, 0, 0))  
-        self.brush_radius = 30 #larghezza massima della pista (la metà sono px per lato) 
+        self.brush_radius = 30 
         
         self.start_position = None
         self.start_angle = 0.0
@@ -32,7 +32,7 @@ class Track:
                 last_p = self.drawing_points[-1]
                 dist = math.hypot(safe_pos[0] - last_p[0], safe_pos[1] - last_p[1])
                 
-                if dist > 5:  
+                if dist > 3:  # Risoluzione di disegno aumentata
                     self.perimeter += dist
                     self.drawing_points.append(safe_pos)
                     
@@ -51,7 +51,7 @@ class Track:
         screen.blit(text, (20, 20))
 
     def close_track(self):
-        """Sana il gap lineare tra l'ultimo punto registrato e il punto di partenza iniziale."""
+        """Sana il gap lineare iniziale-finale ed esegue il post-processing di uniformità superficiale."""
         if len(self.drawing_points) < 2:
             return
             
@@ -59,28 +59,38 @@ class Track:
         p_first = self.drawing_points[0]
         dist = math.hypot(p_first[0] - p_last[0], p_first[1] - p_last[1])
         
-        if dist > 5:
-            steps = int(dist / 5)
+        if dist > 2:
+            steps = int(dist / 2)
             for i in range(1, steps + 1):
                 t = i / steps
                 curr_x = int(p_last[0] + (p_first[0] - p_last[0]) * t)
                 curr_y = int(p_last[1] + (p_first[1] - p_last[1]) * t)
-                
                 self.drawing_points.append((curr_x, curr_y))
-                pygame.draw.circle(self.surface, (255, 255, 255), (curr_x, curr_y), self.brush_radius)
-                
-            self.perimeter += dist
+        
+        # --- ALGORITMO DI POST-PROCESSING SUPERFICIALE CONTRO I BUCHI ---
+        processed_points = []
+        for i in range(len(self.drawing_points)):
+            p_curr = self.drawing_points[i]
+            p_next = self.drawing_points[(i + 1) % len(self.drawing_points)]
+            segment_dist = math.hypot(p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            
+            processed_points.append(p_curr)
+            pygame.draw.circle(self.surface, (255, 255, 255), p_curr, self.brush_radius)
+            
+            if segment_dist > 2.0:
+                fill_steps = int(segment_dist / 2.0)
+                for s in range(1, fill_steps):
+                    t = s / fill_steps
+                    fx = int(p_curr[0] + (p_next[0] - p_curr[0]) * t)
+                    fy = int(p_curr[1] + (p_next[1] - p_curr[1]) * t)
+                    processed_points.append((fx, fy))
+                    pygame.draw.circle(self.surface, (255, 255, 255), (fx, fy), self.brush_radius)
+                    
+        self.drawing_points = processed_points
 
     def generate_checkpoints(self):
-        """Estrae 12 checkpoint equidistanti posizionati lungo la mezzeria del circuito."""
-        self.checkpoints.clear()
-        total_pts = len(self.drawing_points)
-        if total_pts < 20:
-            return
-        
-        step = max(1, total_pts // 12)
-        for i in range(0, total_pts, step):
-            self.checkpoints.append(self.drawing_points[i])
+        """Genera checkpoint perfettamente equidistanti basati sul ricampionamento di main.py."""
+        pass 
 
     def get_pixel_safety(self, x, y):
         if 0 <= x < self.width and 0 <= y < self.height:
