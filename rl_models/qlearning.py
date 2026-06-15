@@ -9,6 +9,8 @@ class TabularQLearner:
         self.gamma = 0.95
         self.epsilon = 0.1
 
+        self.last_grad_norm = 0.0  # Mappa l'errore di differenza temporale (TD Error)
+
     def discretize(self, state_vector):
         # Accorpiamo i 7 sensori in 3 macro-aree fondamentali
         left = min(state_vector[0], state_vector[1], state_vector[2])
@@ -26,16 +28,23 @@ class TabularQLearner:
 
     def select_action(self, disc_state):
         if disc_state not in self.q_table:
-            self.q_table[disc_state] = np.zeros(3)
+            self.q_table[disc_state] = np.zeros(9)
         
         if random.random() < self.epsilon:
-            return random.randint(0, 2) - 1
-        return int(np.argmax(self.q_table[disc_state]) - 1)
+            return random.randint(0, 8)
+        return int(np.argmax(self.q_table[disc_state]))
 
     def update(self, s, action, reward, s_prime):
-        a_idx = action + 1
-        if s not in self.q_table: self.q_table[s] = np.zeros(3)
-        if s_prime not in self.q_table: self.q_table[s_prime] = np.zeros(3)
+        if s not in self.q_table:
+            self.q_table[s] = np.zeros(9)
+        if s_prime not in self.q_table:
+            self.q_table[s_prime] = np.zeros(9)
+            
+        max_next_q = np.max(self.q_table[s_prime])
+        old_q = self.q_table[s][action]
         
-        best_next_q = np.max(self.q_table[s_prime])
-        self.q_table[s][a_idx] += self.lr * (reward + self.gamma * best_next_q - self.q_table[s][a_idx])
+        td_error = reward + self.gamma * max_next_q - old_q
+        self.q_table[s][action] += self.lr * td_error
+        
+        # Il TD Error rappresenta l'equivalente del gradiente per i metodi tabulari
+        self.last_grad_norm = float(abs(td_error))

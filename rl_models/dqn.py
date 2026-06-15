@@ -14,8 +14,10 @@ class DQNNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
-            nn.Linear(16, 3)
+            nn.Linear(16, 9)
         )
+        # Memorizza l'ultima norma del gradiente
+        self.last_grad_norm = 0.0
     def forward(self, x):
         return self.fc(x)
 
@@ -37,19 +39,18 @@ class DQNAgent:
 
     def select_action(self, state_vector):
         if random.random() < self.epsilon:
-            return random.randint(0, 2) - 1
+            return random.randint(0, 8)
+            
+        norm_state = np.array(state_vector) / 250.0
+        state_t = torch.FloatTensor(norm_state).unsqueeze(0)
         with torch.no_grad():
-            # Normalizzazione dell'input numerico in tempo reale
-            norm_state = np.array(state_vector) / 250.0
-            state_t = torch.FloatTensor(norm_state).unsqueeze(0)
-            q_values = self.model(state_t)
-            return int(torch.argmax(q_values).item()) - 1
+            actions_values = self.model(state_t)
+        return int(torch.argmax(actions_values).item())
 
     def store_transition(self, s, a, r, s_prime, done):
-        # Normalizziamo gli stati prima di salvarli nel replay buffer
         norm_s = np.array(s) / 250.0
         norm_s_prime = np.array(s_prime) / 250.0
-        self.memory.append((norm_s, a + 1, r, norm_s_prime, done))
+        self.memory.append((norm_s, a, r, norm_s_prime, done))
 
     def train_step(self, batch_size=64):
         self.steps_counter += 1
@@ -86,4 +87,13 @@ class DQNAgent:
         loss = self.criterion(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # Calcolo della norma L2 del gradiente per il monitoraggio
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        self.last_grad_norm = total_norm ** 0.5
+        
         self.optimizer.step()

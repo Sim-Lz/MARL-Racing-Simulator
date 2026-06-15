@@ -11,6 +11,7 @@ CARS_PER_TEAM = 2
 NUM_TEAMS = 10
 TOTAL_CARS = CARS_PER_TEAM * NUM_TEAMS
 TARGET_LAPS = 5
+NUM_SIMULATIONS = 50
 SESSION_DURATION_MS = 180000  # 180 Secondi di timeout sessione
 
 # Algoritmi assegnati ai rispettivi Team

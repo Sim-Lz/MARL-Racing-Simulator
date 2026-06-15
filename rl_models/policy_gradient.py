@@ -11,9 +11,12 @@ class PolicyNetwork(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(7, 32),
             nn.ReLU(),
-            nn.Linear(32, 3),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 9),
             nn.Softmax(dim=-1)
         )
+        self.last_grad_norm = 0.0  # Per monitorare la stabilità dell'addestramento
     def forward(self, x):
         return self.net(x)
 
@@ -33,7 +36,7 @@ class PolicyGradientAgent:
         m = Categorical(probs)
         action_idx = m.sample()
         self.saved_log_probs.append(m.log_prob(action_idx))
-        return int(action_idx.item() - 1)
+        return int(action_idx.item())
 
     def update_policy(self):
         if not self.rewards:
@@ -56,6 +59,14 @@ class PolicyGradientAgent:
         self.optimizer.zero_grad()
         loss = torch.stack(policy_loss).sum()
         loss.backward()
+        
+        # Calcolo della norma L2 del gradiente per REINFORCE
+        total_norm = 0.0
+        for p in self.policy.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        self.last_grad_norm = total_norm ** 0.5
+        
         self.optimizer.step()
         
         self.saved_log_probs.clear()
