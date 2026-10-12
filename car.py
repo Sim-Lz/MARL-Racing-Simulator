@@ -36,8 +36,11 @@ class Car:
         self.overtakes_performed = 0
         self.checkpoints_passed_total = 0
         self.cumulative_reward = 0.0  
-        self.velocity_rewards_accumulated = 0.0
         self.penalties_accumulated = 0.0
+        self.progress_reward_total = 0.0
+        self.time_penalty_total = 0.0
+        self.terminal_penalty_total = 0.0
+        self.completion_bonus_total = 0.0
         self.slipstream_timer = 0 
         self.stationary_frames = 0
         self.termination_reason = "ALIVE"
@@ -51,14 +54,70 @@ class Car:
             dy = math.sin(rad_angle)
             
             distance = 0.0
-            # Esteso l'orizzonte massimo a 350px per consentire frenate premature ad alta velocità
-            while distance < 350.0:
+            while distance < MAX_RAY_DISTANCE:
                 target_x = self.x + dx * distance
                 target_y = self.y + dy * distance
                 if not track.get_pixel_safety(target_x, target_y):
                     break
                 distance += 2.0  
             self.sensor_distances[i] = distance
+
+    def get_observation(self, track):
+        """Return normalized wall, speed, and next-checkpoint direction features."""
+        sensors = np.clip(self.sensor_distances / MAX_RAY_DISTANCE, 0.0, 1.0)
+        speed = np.clip(self.speed_px / (MAX_SPEED_PX * 1.15), 0.0, 1.0)
+
+        if track.checkpoints:
+            target = track.checkpoints[self.next_checkpoint % len(track.checkpoints)]
+            dx = target[0] - self.x
+            dy = target[1] - self.y
+            bearing = math.atan2(dy, dx) - math.radians(self.angle)
+            bearing = (bearing + math.pi) % (2.0 * math.pi) - math.pi
+            bearing_sin = math.sin(bearing)
+            bearing_cos = math.cos(bearing)
+        else:
+            bearing_sin, bearing_cos = 0.0, 1.0
+
+        return np.concatenate((sensors, [speed, bearing_sin, bearing_cos])).astype(np.float32)
+
+    def race_progress(self, track):
+        """Estimate continuous checkpoint progress, including motion within a segment."""
+        if not track.checkpoints:
+            return 0.0
+
+        count = len(track.checkpoints)
+        checkpoint_index = self.next_checkpoint % count
+        previous = track.checkpoints[(checkpoint_index - 1) % count]
+        target = track.checkpoints[checkpoint_index]
+        segment_length = math.hypot(target[0] - previous[0], target[1] - previous[1])
+        if segment_length <= 1e-6:
+            fraction = 0.0
+        else:
+            distance = math.hypot(target[0] - self.x, target[1] - self.y)
+            fraction = max(-1.0, min(1.0, 1.0 - distance / segment_length))
+        return self.laps * count + self.next_checkpoint + fraction
+
+    def is_on_track(self, track):
+        """Test the car's footprint rather than treating side sensor rays as collisions."""
+        heading = math.radians(self.angle)
+        forward = (math.cos(heading), math.sin(heading))
+        lateral = (-forward[1], forward[0])
+        half_length, half_width = 8.0, 5.0
+
+        samples = [(0.0, 0.0), (half_length, 0.0), (-half_length, 0.0)]
+        for longitudinal in (-half_length, half_length):
+            for sideways in (-half_width, half_width):
+                samples.append((longitudinal, sideways))
+        for sideways in (-half_width, half_width):
+            samples.append((0.0, sideways))
+
+        return all(
+            track.get_pixel_safety(
+                self.x + forward[0] * longitudinal + lateral[0] * sideways,
+                self.y + forward[1] * longitudinal + lateral[1] * sideways,
+            )
+            for longitudinal, sideways in samples
+        )
 
     def update(self, action, track, has_slipstream=False):
         if not self.alive:
@@ -138,8 +197,7 @@ class Car:
             self.alive = False
             self.termination_reason = "DSQ_STALLED"
 
-        # Controllo collisione imminente con i muri esterni/interni
-        if np.any(self.sensor_distances[:5] < CRASH_THRESHOLD) or not track.get_pixel_safety(self.x, self.y):
+        if not self.is_on_track(track):
             self.alive = False
             self.termination_reason = "CRASHED"
             

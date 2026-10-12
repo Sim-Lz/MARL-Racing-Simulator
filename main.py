@@ -1,5 +1,4 @@
 # main.py
-import subprocess
 import sys
 
 try:
@@ -8,12 +7,12 @@ try:
     import torch
     import math
     import random
-except ImportError:
-    print("Dipendenze mancanti rilevate. Avvio l'installazione automatica...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-    except Exception as e:
-        sys.exit(1)
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        f"Dipendenza Python mancante ({exc.name}). "
+        f"Installa i pacchetti del progetto con "
+        f'"{sys.executable}" -m pip install -r requirements.txt.'
+    ) from exc
 
 from config import *
 from track import Track
@@ -25,9 +24,11 @@ from rl_models.genetic import GeneticNetwork
 from rl_models.qlearning import TabularQLearner
 from rl_models.dqn import DQNAgent
 from rl_models.policy_gradient import PolicyGradientAgent
+from rl_models.rewards import calculate_step_reward
+from race_logger import RaceLogger
+from race_flow import should_auto_start_next_race, should_exit_early
 
-NUM_CHECKPOINTS = 50          
-BASE_CHECKPOINT_REWARD = 1000.0  # Raddoppiato il peso specifico del superamento checkpoint
+NUM_CHECKPOINTS = 50
 IDX_S1 = int(NUM_CHECKPOINTS * 0.33)
 IDX_S2 = int(NUM_CHECKPOINTS * 0.67)
 
@@ -50,6 +51,12 @@ global_gradient_registry = {
     "DQN": []
 }
 
+RUN_SEED = random.SystemRandom().randrange(2**32)
+random.seed(RUN_SEED)
+np.random.seed(RUN_SEED)
+torch.manual_seed(RUN_SEED)
+race_logger = RaceLogger()
+
 for car_id in range(TOTAL_CARS):
     team_id = car_id // CARS_PER_TEAM
     algo = TEAM_ALGORITHMS[team_id]
@@ -66,6 +73,7 @@ def get_gradient_norm(agent):
     model_attr = None
     if hasattr(agent, 'model'): model_attr = agent.model
     elif hasattr(agent, 'policy_net'): model_attr = agent.policy_net
+    elif hasattr(agent, 'policy'): model_attr = agent.policy
     
     if model_attr and isinstance(model_attr, torch.nn.Module):
         for p in model_attr.parameters():
@@ -76,9 +84,10 @@ def get_gradient_norm(agent):
     return 0.0 # Ritorna 0 per Heuristic, Genetic, Tabular Q-Learning (Non basati su backpropagation diretta)
 
 def initialize_race_session():
-    global cars, teams
+    global cars, teams, best_lap_time_current_race
     cars.clear()
     teams.clear()
+    best_lap_time_current_race = float('inf')
     
     shuffled_car_ids = list(range(TOTAL_CARS))
     random.shuffle(shuffled_car_ids)
@@ -121,6 +130,14 @@ def initialize_race_session():
         team_cars = [cars[team_id * 2], cars[team_id * 2 + 1]]
         teams.append(Team(team_id, TEAM_ALGORITHMS[team_id], team_cars))
 
+def start_next_race():
+    global state, session_timer, race_finished, post_race_elapsed_ms
+    initialize_race_session()
+    session_timer = 0
+    race_finished = False
+    post_race_elapsed_ms = 0
+    state = "RACING"
+
 def check_car_to_car_collisions():
     num_checkpoints = len(track.checkpoints)
     if num_checkpoints == 0: return
@@ -141,7 +158,7 @@ def print_deep_simulation_report(gen_num, car_list, reason):
     total_sim_checkpoints = NUM_CHECKPOINTS * TARGET_LAPS
     
     print(f"\n=====================================================================================================================")
-    print(f"📊 REPORT SIMULAZIONE N° {gen_num} | MOTIVAZIONE CHIUSURA: {reason}")
+    print(f"REPORT SIMULAZIONE N° {gen_num} | MOTIVAZIONE CHIUSURA: {reason}")
     print(f"=====================================================================================================================")
     print(f"| ID | ALGORITMO       | STATO       | GIRI COMPL. | CHECKPOINTS | V-MAX     | T-SURVIVAL | REWARD TOT | GRAD. L2  |")
     print(f"---------------------------------------------------------------------------------------------------------------------")
@@ -156,7 +173,7 @@ def print_deep_simulation_report(gen_num, car_list, reason):
     
 def print_grand_final_report():
     print(f"\n==========================================================================================")
-    print(f"🔬 GRAND SCIENTIFIC REPORT: METRICHE AGGREGATE FINALI ({generation_count - 1} GENERAZIONI)")
+    print(f"GRAND SCIENTIFIC REPORT: METRICHE AGGREGATE FINALI ({generation_count} GENERAZIONI)")
     print(f"==========================================================================================")
     
     algo_metrics = {algo: {'aes': [], 'speed': [], 'reward': [], 'overtakes': []} for algo in set(TEAM_ALGORITHMS)}
@@ -206,6 +223,8 @@ best_lap_time_current_track = float('inf')
 best_s1_time = float('inf')
 best_s2_time = float('inf')
 best_s3_time = float('inf')
+best_lap_time_current_race = float('inf')
+post_race_elapsed_ms = 0
 
 while True:
     dt = clock.tick(FPS)
@@ -214,6 +233,10 @@ while True:
             pygame.quit()
             sys.exit()
         if event.type == pygame.KEYDOWN:
+            if should_exit_early(state, event.key, pygame.K_ESCAPE):
+                pygame.quit()
+                sys.exit()
+
             if event.key == pygame.K_RETURN and state == "DRAWING" and len(track.drawing_points) > 20:
                 track.close_track()
                 
@@ -254,16 +277,18 @@ while True:
                     best_s2_time = float('inf')
                     best_s3_time = float('inf')
                 elif event.key == pygame.K_SPACE:
-                    state = "RACING"
-                    initialize_race_session()
-                    session_timer = 0
-                    race_finished = False
+                    start_next_race()
 
             if state == "DRAWING":
                 if event.key == pygame.K_UP:
                     track.brush_radius = min(80, track.brush_radius + 5)
                 elif event.key == pygame.K_DOWN:
                     track.brush_radius = max(12, track.brush_radius - 5)
+
+    if state == "POST_RACE":
+        post_race_elapsed_ms += dt
+        if should_auto_start_next_race(state, post_race_elapsed_ms):
+            start_next_race()
 
     if state == "DRAWING":
         track.draw_step(screen)
@@ -315,7 +340,16 @@ while True:
                         car_a.was_behind_last_frame = car_b.car_id
                         break
 
-        current_states = {car.car_id: car.sensor_distances.copy() for car in cars if car.alive}
+        current_states = {
+            car.car_id: car.get_observation(track)
+            for car in cars
+            if car.alive
+        }
+        progress_before = {
+            car.car_id: car.race_progress(track)
+            for car in cars
+            if car.alive
+        }
         actions = {}
         
         for car in cars:
@@ -341,27 +375,19 @@ while True:
             r = 0.0
             car.update(actions[car.car_id], track, slipstream_flags.get(car.car_id, False))
             
-            # Penalità proattiva per stallo: se la vettura è stata squalificata per stallo, assegna un malus significativo
-            if not car.alive and getattr(car, 'termination_reason', '') == "DSQ_STALLED" and not getattr(car, 'stall_penalized', False):
-                r -= 100.0
-                car.stall_penalized = True
-
-            target_cp = track.checkpoints[car.next_checkpoint]
-            cx_dir = target_cp[0] - car.x
-            cy_dir = target_cp[1] - car.y
-            c_dist = math.hypot(cx_dir, cy_dir)
-            
-            alignment_factor = 0.0
-            if c_dist > 0:
-                cx_dir /= c_dist
-                cy_dir /= c_dist
-                car_x_dir = math.cos(math.radians(car.angle))
-                car_x_dir_y = math.sin(math.radians(car.angle))
-                alignment_factor = cx_dir * car_x_dir + cy_dir * car_x_dir_y
-
-            if track.checkpoints:
-                if c_dist < track.brush_radius * 1.4:
-                    r += BASE_CHECKPOINT_REWARD / NUM_CHECKPOINTS
+            if car.alive and track.checkpoints:
+                target_cp = track.checkpoints[car.next_checkpoint]
+                c_dist = math.hypot(target_cp[0] - car.x, target_cp[1] - car.y)
+                previous_cp = track.checkpoints[(car.next_checkpoint - 1) % len(track.checkpoints)]
+                checkpoint_spacing = math.hypot(
+                    target_cp[0] - previous_cp[0],
+                    target_cp[1] - previous_cp[1],
+                )
+                checkpoint_radius = max(
+                    2.0,
+                    min(track.brush_radius * 0.30, checkpoint_spacing * 0.35),
+                )
+                if c_dist < checkpoint_radius:
                     car.checkpoints_passed_total += 1
                     
                     if car.next_checkpoint == IDX_S1:
@@ -387,50 +413,36 @@ while True:
                         lap_time_ms = session_timer - car.last_lap_timer
                         car.last_lap_timer = session_timer
                         lap_time_s = max(0.5, lap_time_ms / 1000.0)
+                        best_lap_time_current_race = min(
+                            best_lap_time_current_race,
+                            lap_time_s,
+                        )
                         
-                        if best_lap_time_current_track == float('inf'):
-                            r += 500.0
+                        if lap_time_s < best_lap_time_current_track:
                             best_lap_time_current_track = lap_time_s
-                        else:
-                            r += 500.0 * (best_lap_time_current_track / lap_time_s)
-                            if lap_time_s < best_lap_time_current_track:
-                                best_lap_time_current_track = lap_time_s
                         
                         if car.laps >= TARGET_LAPS:
                             race_finished = True
                             winner_info = f"Vettura {car.car_id} ({TEAM_ALGORITHMS[car.team_id]})"
+                            car.termination_reason = "COMPLETED"
+                            r += calculate_step_reward(0.0, 0, finished=True)
+                            car.completion_bonus_total += FINISH_BONUS
 
-            forward_velocity_incentive = max(0.0, alignment_factor)
-            v_reward = (car.speed_px / MAX_SPEED_PX) * forward_velocity_incentive * 0.4
-            
-            # Micro-penalità base di tempo
-            step_penalty = -0.15 
-            
-            # Punizione proattiva per frenate inutili (Freno tirato con strada libera davanti)
-            # Estratta l'azione longitudinale dall'azione combinata (classi 6, 7, 8 indicano frenata)
-            is_braking = actions[car.car_id] in [6, 7, 8]
-            center_d = car.sensor_distances[3]
-            
-            if is_braking and center_d > 200.0:
-                brake_penalty = -0.3  # Malus per panico o inefficienza in rettilineo
-                step_penalty += brake_penalty
-            
-            r += (v_reward + step_penalty)
-            car.velocity_rewards_accumulated += v_reward
-            car.penalties_accumulated += abs(step_penalty)
-            
-            if slipstream_flags.get(car.car_id, False):
-                r += 0.2
+            progress_delta = car.race_progress(track) - progress_before[car.car_id]
+            progress_reward = PROGRESS_REWARD_SCALE * progress_delta
+            time_penalty = TIME_PENALTY_PER_SECOND * dt / 1000.0
+            r += calculate_step_reward(progress_delta, dt)
+            car.progress_reward_total += progress_reward
+            car.time_penalty_total += time_penalty
+            car.penalties_accumulated += time_penalty
 
-            if alignment_factor < -0.2:
-                r -= 2.0
+            if car.get_observation(track)[-1] < -0.2:
                 if not hasattr(car, 'backwards_timer'): car.backwards_timer = 0.0
                 car.backwards_timer += dt
                 if car.backwards_timer >= 2500:
                     car.alive = False
                     car.dsq_triggered = True
                     car.termination_reason = "DSQ_BACK"
-                    r -= 100.0
             else:
                 car.backwards_timer = 0.0
 
@@ -440,11 +452,24 @@ while True:
         # Calcola le collisioni auto-auto che modificano lo stato 'alive' delle vetture
         check_car_to_car_collisions()
 
-        # Genera il dizionario aggiornato dello stato vitale post-collisione richiesto da team.py
         current_cars_alive = {c.car_id: c.alive for c in cars}
+        just_dead_cars = [
+            car for car in cars
+            if car.car_id in current_states and not car.alive and not car.crash_triggered
+        ]
+        for car in just_dead_cars:
+            individual_raw_rewards[car.car_id] -= CRASH_PENALTY
+            car.terminal_penalty_total += CRASH_PENALTY
+            car.crash_triggered = True
+
+        active_cars = sum(1 for car in cars if car.alive)
+        session_terminal = (
+            race_finished
+            or active_cars == 0
+            or session_timer >= SESSION_DURATION_MS
+        )
 
         for team in teams:
-            # Passaggio esplicito dei dizionari richiesti dalla firma locale
             team_rewards = team.compute_cooperative_rewards(individual_raw_rewards, current_cars_alive)
             for car in team.cars:
                 if car.car_id not in current_states: continue
@@ -452,46 +477,31 @@ while True:
                 agent = agents[car.car_id]
                 algo = TEAM_ALGORITHMS[car.team_id]
                 s = current_states[car.car_id]
-                s_prime = car.sensor_distances.copy()
+                s_prime = car.get_observation(track)
                 a = actions[car.car_id]
                 
-                final_r = team_rewards[car.car_id] + individual_raw_rewards[car.car_id]
-                
-                is_just_dead = not car.alive and not car.crash_triggered
-                
-                if is_just_dead:
-                    car.crash_triggered = True
-                    total_cps_possible = TARGET_LAPS * NUM_CHECKPOINTS
-                    cps_missing = max(0, total_cps_possible - car.checkpoints_passed_total)
-                    crash_penalty = 300.0 + (cps_missing / total_cps_possible) * 1200.0
-                    final_r -= crash_penalty
-                    car.penalties_accumulated += crash_penalty
-                    done = True
-                else:
-                    done = not car.alive
+                final_r = team_rewards[car.car_id]
+                is_just_dead = car in just_dead_cars
+                done = not car.alive or session_terminal
 
-                # Aggiorna il cumulative reward solo se l'auto stava attivamente correndo o è appena morta
                 if car.alive or is_just_dead:
                     car.cumulative_reward += final_r  
 
-                    # PREVENZIONE POISONING: Salva l'esperienza in memoria SOLO se l'auto è viva o nel frame esatto in cui muore.
                     if algo == "Q_LEARNING":
-                        agent.update(agent.discretize(s), a, final_r, agent.discretize(s_prime))
+                        agent.update(
+                            agent.discretize(s),
+                            a,
+                            final_r,
+                            agent.discretize(s_prime),
+                            done=done,
+                        )
                     elif algo == "DQN":
                         agent.store_transition(s, a, final_r, s_prime, done)
                         agent.train_step()
                     elif algo == "POLICY_GRADIENT":
                         agent.rewards.append(final_r)
 
-        def get_race_progress(c):
-            if not track.checkpoints: return 0
-            cp_idx = c.next_checkpoint % len(track.checkpoints)
-            target_cp = track.checkpoints[cp_idx]
-            dist_to_cp = math.hypot(c.x - target_cp[0], c.y - target_cp[1])
-            total_checkpoints_passed = c.laps * len(track.checkpoints) + c.next_checkpoint
-            return total_checkpoints_passed * 10000 - dist_to_cp
-
-        sorted_cars = sorted(cars, key=get_race_progress, reverse=True)
+        sorted_cars = sorted(cars, key=lambda car: car.race_progress(track), reverse=True)
         
         panel_x = WIDTH - 260
         pygame.draw.rect(screen, (20, 20, 20), (panel_x, 10, 250, 260))
@@ -524,6 +534,9 @@ while True:
         if race_finished or active_cars == 0 or session_timer >= SESSION_DURATION_MS:
             if race_finished:
                 reason_str = f"VITTORIA AGENTE ({winner_info})"
+                for car in cars:
+                    if car.alive and car.laps < TARGET_LAPS:
+                        car.termination_reason = "RACE_ENDED"
             elif active_cars == 0:
                 reason_str = "TUTTE LE AUTO OUT (ALL CRASHED/DNF)"
             else:
@@ -546,30 +559,22 @@ while True:
                     'survival_time': car.survival_time_s
                 })
 
-                if car.laps < TARGET_LAPS:
-                    agent = agents[car.car_id]
-                    algo = TEAM_ALGORITHMS[car.team_id]
-                    s = car.sensor_distances.copy()
-                    timeout_penalty = -500.0 - (TARGET_LAPS - car.laps) * 100.0
-                    
-                    if car.alive:
-                        if algo == "DQN":
-                            agent.store_transition(s, 0, timeout_penalty, s, True)
-                            agent.train_step()
-                        elif algo == "Q_LEARNING":
-                            agent.update(agent.discretize(s), 0, timeout_penalty, agent.discretize(s))
-                        elif algo == "POLICY_GRADIENT":
-                            agent.rewards.append(timeout_penalty)
-            
             genetic_car_ids = [c.car_id for c in cars if TEAM_ALGORITHMS[c.team_id] == "GENETIC"]
             if genetic_car_ids:
-                num_cps = len(track.checkpoints) if track.checkpoints else 1
-                best_genetic_id = max(genetic_car_ids, key=lambda cid: (cars[cid].laps * num_cps + cars[cid].next_checkpoint))
+                best_genetic_id = max(
+                    genetic_car_ids,
+                    key=lambda cid: (
+                        cars[cid].race_progress(track),
+                        cars[cid].cumulative_reward,
+                    ),
+                )
                 best_net = agents[best_genetic_id]
                 for cid in genetic_car_ids:
                     if cid != best_genetic_id:
                         agents[cid].W1 = best_net.W1.copy()
+                        agents[cid].b1 = best_net.b1.copy()
                         agents[cid].W2 = best_net.W2.copy()
+                        agents[cid].b2 = best_net.b2.copy()
                         agents[cid].mutate()
 
             # Contenitori temporanei per la generazione corrente
@@ -600,6 +605,38 @@ while True:
                 global_gradient_registry["DQN"].append(np.mean(current_gen_dqn_grads))
             else:
                 global_gradient_registry["DQN"].append(0.0)
+
+            race_settings = {
+                "target_laps": TARGET_LAPS,
+                "num_checkpoints": NUM_CHECKPOINTS,
+                "fps": FPS,
+                "sensor_angles": SENSOR_ANGLES,
+                "max_ray_distance": MAX_RAY_DISTANCE,
+                "observation_size": OBSERVATION_SIZE,
+                "max_speed_px_s": MAX_SPEED_PX,
+                "acceleration_px_s2": ACCELERATION,
+                "deceleration_px_s2": DECELERATION,
+                "q_learning_gamma": 0.999,
+                "dqn_gamma": 0.995,
+                "policy_gradient_gamma": 0.999,
+                "progress_reward_scale": PROGRESS_REWARD_SCALE,
+                "time_penalty_per_second": TIME_PENALTY_PER_SECOND,
+                "crash_penalty": CRASH_PENALTY,
+                "finish_bonus": FINISH_BONUS,
+                "team_reward_share": TEAM_REWARD_SHARE,
+            }
+            race_logger.record_race(
+                generation=generation_count,
+                reason=reason_str,
+                duration_ms=session_timer,
+                track=track,
+                cars=cars,
+                algorithms=TEAM_ALGORITHMS,
+                agents=agents,
+                settings=race_settings,
+                seed=RUN_SEED,
+                best_lap_time=best_lap_time_current_race,
+            )
                 
             if generation_count == NUM_SIMULATIONS:
                 print_grand_final_report()
@@ -608,6 +645,7 @@ while True:
                 
             generation_count += 1
             state = "POST_RACE"
+            post_race_elapsed_ms = 0
 
     elif state == "POST_RACE":
         screen.blit(track.surface, (0, 0))
@@ -617,11 +655,14 @@ while True:
         f_menu = pygame.font.SysFont("Arial", 18, bold=True)
         txt_gen = f_menu.render(f"Simulazione {generation_count - 1} COMPLETATA", True, (0, 255, 0))
         txt_opt1 = f_menu.render("Premi R per RIDISEGNARE un nuovo tracciato", True, (255, 255, 255))
-        txt_opt2 = f_menu.render("Premi SPAZIO per RIPARTIRE sulla stessa pista", True, (255, 255, 255))
+        seconds_left = max(0.0, (POST_RACE_DELAY_MS - post_race_elapsed_ms) / 1000.0)
+        txt_opt2 = f_menu.render(f"Prossima corsa automatica tra {seconds_left:.1f}s", True, (255, 255, 255))
+        txt_opt3 = f_menu.render("SPAZIO: subito | ESC: termina", True, (255, 255, 255))
         
         screen.blit(txt_gen, (WIDTH//2 - 140, HEIGHT//2 - 45))
         screen.blit(txt_opt1, (WIDTH//2 - 210, HEIGHT//2 - 5))
-        screen.blit(txt_opt2, (WIDTH//2 - 210, HEIGHT//2 + 25))
+        screen.blit(txt_opt2, (WIDTH//2 - 210, HEIGHT//2 + 20))
+        screen.blit(txt_opt3, (WIDTH//2 - 210, HEIGHT//2 + 45))
 
     pygame.display.flip()
 

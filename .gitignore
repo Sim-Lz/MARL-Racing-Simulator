@@ -1,5 +1,10 @@
 # File di sistema
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # File snapshot
 snapshot.md
+
+# Risultati delle simulazioni
+race_logs/

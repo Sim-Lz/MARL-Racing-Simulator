@@ -1,6 +1,4 @@
 # config.py
-import pygame
-
 # Dimensioni Schermo
 WIDTH = 1500
 HEIGHT = 1000
@@ -13,6 +11,7 @@ TOTAL_CARS = CARS_PER_TEAM * NUM_TEAMS
 TARGET_LAPS = 5
 NUM_SIMULATIONS = 50
 SESSION_DURATION_MS = 180000  # 180 Secondi di timeout sessione
+POST_RACE_DELAY_MS = 2000
 
 # Algoritmi assegnati ai rispettivi Team
 TEAM_ALGORITHMS = [
@@ -43,9 +42,16 @@ TEAM_COLORS = [
 ]
 
 # Configurazione Sensori (Raggi di Prossimità)
-SENSOR_ANGLES = [-90, -45, -22.5, 0, 22.5, 45, 90]
-MAX_RAY_DISTANCE = 250.0
-CRASH_THRESHOLD = 8.0
+SENSOR_ANGLES = [-90, -55, -25, 0, 25, 55, 90]
+MAX_RAY_DISTANCE = 400.0
+OBSERVATION_SIZE = len(SENSOR_ANGLES) + 3
+
+# Reward terms are based on route progress, not speed or a particular control choice.
+PROGRESS_REWARD_SCALE = 8.0
+TIME_PENALTY_PER_SECOND = 0.05
+CRASH_PENALTY = 5.0
+FINISH_BONUS = 20.0
+TEAM_REWARD_SHARE = 0.05
 
 # Dinamica del Veicolo e Limiti di Tolleranza
 MAX_STEER_ANGLE = 5.0       # Angolo massimo di sterzata (gradi)
