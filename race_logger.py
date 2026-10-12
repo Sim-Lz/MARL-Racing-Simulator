@@ -5,8 +5,26 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
+SHARP_CORNER_CURVATURE = 1.0 / 60.0   # raggio < 60 px
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (np.floating, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
 
 class RaceLogger:
+    """Scrive in race_logs/<run_id>/ un record JSONL per tracciato (tracks.jsonl) e uno per corsa (races.jsonl)."""
+
     def __init__(self, root="race_logs"):
         self.started_at = datetime.now(timezone.utc)
         self.run_id = f"{self.started_at:%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}"
@@ -43,7 +61,7 @@ class RaceLogger:
         if track_id not in self._written_tracks:
             self._append_json_line(
                 self.run_directory / "tracks.jsonl",
-                {"track_id": track_id, **track_identity, **self._track_features(checkpoints)},
+                {"track_id": track_id, **track_identity, **self._track_features(track, checkpoints)},
             )
             self._written_tracks.add(track_id)
 
@@ -57,18 +75,32 @@ class RaceLogger:
                     "algorithm": algorithms[car.team_id],
                     "laps": car.laps,
                     "checkpoints_passed": car.checkpoints_passed_total,
+                    "race_progress": getattr(car, "progress_px", 0.0) / max(1e-9, self._spacing(track)),
                     "completed": car.laps >= settings["target_laps"],
                     "termination_reason": car.termination_reason,
+                    "death": getattr(car, "death_info", None),
                     "steps": car.total_steps,
+                    "decisions": getattr(car, "decisions", None),
                     "survival_seconds": car.survival_time_s,
                     "distance_traveled": car.distance_traveled,
                     "max_speed_px_s": car.max_speed_reached,
+                    "average_speed_px_s": car.average_speed() if hasattr(car, "average_speed") else None,
+                    "lap_times": list(getattr(car, "lap_times", [])),
                     "cumulative_reward": car.cumulative_reward,
+                    "individual_reward": getattr(car, "individual_reward_total", None),
                     "progress_reward": car.progress_reward_total,
                     "time_penalty": car.time_penalty_total,
                     "terminal_penalty": car.terminal_penalty_total,
+                    "collision_penalty": getattr(car, "collision_penalty_total", 0.0),
                     "completion_bonus": car.completion_bonus_total,
+                    "collisions_caused": getattr(car, "collisions_caused", 0),
+                    "collisions_suffered": getattr(car, "collisions_suffered", 0),
                     "overtakes": car.overtakes_performed,
+                    "slipstream_frames": getattr(car, "slipstream_frames", 0),
+                    "line": self._line_summary(car),
+                    "training_respawns": getattr(car, "training_respawns", 0),
+                    "training_progress": getattr(car, "training_progress_total", 0.0),
+                    "training_reward": getattr(car, "training_reward_total", 0.0),
                     "agent_state": self._agent_state(agent),
                 }
             )
@@ -88,12 +120,36 @@ class RaceLogger:
         self._append_json_line(self.run_directory / "races.jsonl", race_record)
 
     @staticmethod
-    def _append_json_line(path, record):
-        with path.open("a", encoding="utf-8", newline="\n") as log_file:
-            log_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+    def _line_summary(car):
+        """Uso della carreggiata: valori normalizzati sulla semi-larghezza della pista.
+        inside_in_corners > 0 = l'auto sta all'interno delle curve (tende alla corda), < 0 = all'esterno.
+        speed_vs_ideal = velocità media / velocità del profilo ideale nello stesso punto."""
+        stats = getattr(car, "line_stats", None)
+        if not stats or not stats["frames"]:
+            return None
+        frames = stats["frames"]
+        return {
+            "mean_abs_lateral": stats["abs_lateral"] / frames,
+            "inside_in_corners": stats["inside"] / stats["corner_frames"] if stats["corner_frames"] else None,
+            "speed_vs_ideal": stats["speed_ratio"] / frames,
+            "mean_racing_line_error": stats["line_error"] / frames,
+            "traffic_fraction": stats["traffic_frames"] / frames,
+        }
 
     @staticmethod
-    def _track_features(checkpoints):
+    def _spacing(track):
+        spacing = getattr(track, "checkpoint_spacing", None)
+        if isinstance(spacing, (int, float)) and spacing > 0:
+            return spacing
+        return 1.0
+
+    @staticmethod
+    def _append_json_line(path, record):
+        with path.open("a", encoding="utf-8", newline="\n") as log_file:
+            log_file.write(json.dumps(_json_safe(record), ensure_ascii=False, allow_nan=False) + "\n")
+
+    @staticmethod
+    def _track_features(track, checkpoints):
         if len(checkpoints) < 2:
             return {"checkpoint_spacing": {}, "turn_angle_degrees": {}}
 
@@ -113,7 +169,7 @@ class RaceLogger:
             ) - math.pi
             turn_angles.append(abs(math.degrees(delta)))
 
-        return {
+        features = {
             "checkpoint_spacing": {
                 "minimum": min(spacings),
                 "mean": sum(spacings) / len(spacings),
@@ -123,45 +179,46 @@ class RaceLogger:
                 "mean_absolute": sum(turn_angles) / len(turn_angles),
                 "maximum_absolute": max(turn_angles),
             },
+            "checkpoint_turn_angles_degrees": turn_angles,
         }
+
+        curvature = getattr(track, "curvature", None)
+        if curvature is not None and len(curvature) > 0:
+            # Curvatura media su ~20 px per attenuare il rumore del disegno a mano.
+            kernel = np.ones(11) / 11.0
+            smooth = np.convolve(np.concatenate([curvature[-5:], curvature, curvature[:5]]), kernel, mode="valid")
+            absolute = np.abs(smooth)
+            sharp = absolute > SHARP_CORNER_CURVATURE
+            corners = int(np.sum(sharp & ~np.roll(sharp, 1)))
+            features.update({
+                "length_px": float(track.length),
+                "track_width_px": float(track.brush_radius * 2),
+                "curvature": {
+                    "mean_absolute": float(absolute.mean()),
+                    "p90_absolute": float(np.percentile(absolute, 90)),
+                    "maximum_absolute": float(absolute.max()),
+                    "minimum_radius_px": float(1.0 / max(absolute.max(), 1e-9)),
+                    "sharp_fraction": float(sharp.mean()),
+                    "sharp_corner_count": corners,
+                    "net_turning_degrees": float(math.degrees(np.sum(curvature) * track.step)),
+                },
+                "ideal_lap_seconds": float(getattr(track, "ideal_lap_time", float("nan"))),
+                "ideal_speed_px_s": {
+                    "mean": float(np.mean(track.racing_speed)),
+                    "minimum": float(np.min(track.racing_speed)),
+                } if getattr(track, "racing_speed", None) is not None else None,
+                "racing_offset_by_checkpoint": [
+                    float(chunk.mean()) for chunk in np.array_split(track.racing_offset, len(checkpoints))
+                ] if getattr(track, "racing_offset", None) is not None else None,
+                # Profilo di curvatura per checkpoint (segno: + = destra) per correlare le uscite di pista.
+                "curvature_by_checkpoint": [
+                    float(chunk.mean()) for chunk in np.array_split(smooth, len(checkpoints))
+                ],
+            })
+        return features
 
     @staticmethod
     def _agent_state(agent):
-        state = {}
-        if hasattr(agent, "epsilon"):
-            state["epsilon"] = float(agent.epsilon)
-        if hasattr(agent, "memory"):
-            state["replay_size"] = len(agent.memory)
-            state["optimizer_steps"] = int(agent.steps_counter)
-            state["training_calls"] = int(agent.training_calls)
-        if hasattr(agent, "q_table"):
-            state["q_table_states"] = len(agent.q_table)
-        if hasattr(agent, "saved_log_probs"):
-            state["pending_policy_actions"] = len(agent.saved_log_probs)
-        if hasattr(agent, "last_grad_norm"):
-            state["last_grad_norm"] = float(agent.last_grad_norm)
-        if hasattr(agent, "last_td_error"):
-            state["last_td_error"] = float(agent.last_td_error)
-        if hasattr(agent, "last_mutation_norm"):
-            state["last_mutation_norm"] = float(agent.last_mutation_norm)
-        for attribute in (
-            "lr",
-            "learning_rate",
-            "gamma",
-            "epsilon_decay",
-            "min_epsilon",
-            "minimum_replay_size",
-            "batch_size",
-            "training_interval",
-            "target_update_interval",
-            "entropy_coefficient",
-            "max_grad_norm",
-            "mutation_rate",
-            "mutation_fraction",
-        ):
-            if hasattr(agent, attribute):
-                state[attribute] = getattr(agent, attribute)
-        model = getattr(agent, "model", getattr(agent, "policy", None))
-        if "last_grad_norm" not in state and model is not None and hasattr(model, "last_grad_norm"):
-            state["last_grad_norm"] = float(model.last_grad_norm)
-        return state
+        if hasattr(agent, "diagnostics"):
+            return agent.diagnostics()
+        return {}
