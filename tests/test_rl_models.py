@@ -144,6 +144,13 @@ class RewardTests(unittest.TestCase):
         self.assertAlmostEqual(calculate_step_reward(0, 0, terminated=True).total, -TERMINATION_PENALTY)
         self.assertAlmostEqual(calculate_step_reward(0, 0, collisions_at_fault=1).total, -COLLISION_PENALTY)
 
+    def test_personal_best_bonus_is_proportional_and_capped(self):
+        bonus = calculate_step_reward(0, 0, personal_best_improvements=(0.05,)).personal_best_bonus
+        self.assertAlmostEqual(bonus, 0.05 * config.PERSONAL_BEST_REWARD_SCALE)
+        capped = calculate_step_reward(0, 0, personal_best_improvements=(0.9,)).personal_best_bonus
+        self.assertAlmostEqual(capped, config.PERSONAL_BEST_REWARD_CAP)
+        self.assertLess(config.PERSONAL_BEST_REWARD_CAP, TERMINATION_PENALTY)
+
     def test_team_sharing_is_positive_only_and_not_double_counted(self):
         car_a = SimpleNamespace(car_id=0)
         car_b = SimpleNamespace(car_id=1)
@@ -173,19 +180,43 @@ class AgentTests(unittest.TestCase):
             agent.begin_race([0])
             self.assertIn(agent.act(0, self.observation), range(NUM_ACTIONS))
 
-    def test_heuristic_brakes_when_faster_than_the_ideal_profile(self):
-        sim = RaceSimulation(self.track, create_agents(["HEURISTIC"]), ["HEURISTIC"])
-        agent = sim.agents[0]
+    def test_heuristic_brakes_before_a_hairpin_using_only_the_observation(self):
+        agent = HeuristicController()
+        observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+        observation[:config.NUM_SENSORS] = 1.0                      # nessun muro vicino
+        observation[OBS_HEADING_COS] = 1.0
+        observation[OBS_SPEED] = config.MAX_SPEED_PX / (config.MAX_SPEED_PX * 1.15)
+        self.assertNotEqual(agent.act(0, observation) // 3, 2)     # rettilineo: non frena
+        observation[config.OBS_TRACK_HEADING:config.OBS_TRACK_HEADING + 3] = (0.3, 1.0, 1.0)
+        self.assertEqual(agent.act(0, observation) // 3, 2)        # tornante in arrivo: frena
+
+    def test_heuristic_does_not_read_the_racing_line(self):
+        track = make_track()
+        sim = RaceSimulation(track, create_agents(["HEURISTIC"]), ["HEURISTIC"])
+        track.racing_points = track.racing_speed = track.racing_offset = None   # traiettoria non disponibile
+        for _ in range(int(5 * config.FPS)):
+            sim.step()
+        self.assertTrue(all(car.alive for car in sim.cars))
+
+    def test_sector_records_track_holders_and_personal_bests(self):
+        sim = RaceSimulation(self.track, create_agents(["DQN"]), ["DQN"], generation=3)
         car = sim.cars[0]
-        slowest = int(np.argmin(self.track.racing_speed))
-        car.x, car.y = self.track.racing_points[slowest]
-        car.update_track_position(self.track, initial=True)
-        car.speed_px = config.MAX_SPEED_PX
-        self.assertEqual(agent.act(0, car.get_observation(self.track)) // 3, 2)
+        sim._record_sector(car, 0, 10.0)
+        self.assertNotIn(car.slot, sim._personal_best_improvements)   # primo tempo: nessun bonus
+        sim._record_sector(car, 0, 9.0)
+        self.assertAlmostEqual(sim._personal_best_improvements[car.slot][0], 0.1)
+        sim._record_sector(car, 0, 9.5)                                # più lento: nessun bonus
+        self.assertEqual(len(sim._personal_best_improvements[car.slot]), 1)
+        self.assertEqual(sim.best_sector_holders[0]["car_id"], car.car_id)
+        self.assertEqual(sim.best_sector_holders[0]["generation"], 3)
+        self.assertAlmostEqual(sim.best_sector_times[0], 9.0)
+        sim._record_lap(car, 30.0)
+        self.assertEqual(sim.best_lap_holder["algorithm"], "DQN")
+        self.assertAlmostEqual(sim.personal_best_laps[car.car_id], 30.0)
 
     def test_q_learning_bootstraps_truncations_but_not_terminations(self):
         agent = TabularQLearner()
-        state, next_state = (0, 0, 0, 0, 0, 0), (1, 1, 1, 1, 1, 0)
+        state, next_state = (0, 0, 0, 0, 0, 0, 0), (1, 1, 1, 1, 1, 1, 0)
         agent.q_table[next_state] = np.full(NUM_ACTIONS, 10.0)
 
         agent.update(state, 4, 1.0, next_state, done=True)
@@ -275,6 +306,13 @@ class SimulationTests(unittest.TestCase):
         self.assertTrue(all(car.alive for car in sim.cars))
         self.assertTrue(all(car.laps >= 1 for car in sim.cars))
 
+    def test_session_lasts_longer_on_long_tracks(self):
+        from simulation import session_limit_ms
+        self.assertEqual(session_limit_ms(SimpleNamespace(length=1000.0)), config.SESSION_DURATION_MS)
+        long_track = SimpleNamespace(length=8487.0)
+        expected = 1000.0 * config.TARGET_LAPS * 8487.0 / config.SESSION_MIN_AVERAGE_SPEED_PX
+        self.assertAlmostEqual(session_limit_ms(long_track), expected)
+
     def test_grid_fits_a_narrow_track(self):
         random.seed(2)
         track = make_track(radius=12)
@@ -308,6 +346,48 @@ class SimulationTests(unittest.TestCase):
         self.assertIn(victim.car_id + GHOST_SLOT_OFFSET, sim.ghosts)
         self.assertEqual(victim.training_respawns, 1)
         self.assertEqual(sim.active_cars(), 1)
+
+    def test_ghosts_feel_race_traffic_but_race_cars_ignore_ghosts(self):
+        track = make_track()
+        sim = RaceSimulation(track, create_agents(["DQN"]), ["DQN"])
+        racer, other = sim.cars
+        other.x, other.y = -50.0, -50.0
+        other.alive = False
+        ghost = Car(other.car_id, other.team_id, other.index_in_team, (racer.x, racer.y), racer.angle, other.color)
+        ghost.is_ghost, ghost.slot = True, other.car_id + GHOST_SLOT_OFFSET
+        # Fantasma subito dietro l'auto in gara, più veloce: la vede come traffico e la tampona.
+        ghost.x -= math.cos(math.radians(racer.angle)) * 8.0
+        ghost.y -= math.sin(math.radians(racer.angle)) * 8.0
+        ghost.update_track_position(track, initial=True)
+        ghost.speed_px, racer.speed_px = 200.0, 100.0
+        sim.ghosts[ghost.slot] = ghost
+        sim._update_traffic()
+        self.assertGreater(ghost.traffic_features[0], 0.9)
+        self.assertEqual(racer.traffic_features, (0.0, 0.0, 0.0))
+        self.assertEqual(sim._resolve_ghost_collisions([racer]), {ghost.slot: 1})
+        self.assertAlmostEqual(ghost.speed_px, 200.0 * config.COLLISION_SPEED_FACTOR_AT_FAULT)
+        self.assertEqual(racer.speed_px, 100.0)
+        self.assertEqual(racer.collisions_suffered, 0)
+
+    def test_q_learning_seeds_unseen_traffic_states_from_free_road(self):
+        agent = TabularQLearner()
+        agent.q_table[(1, 2, 3, 1, 2, 1, 0)] = np.arange(NUM_ACTIONS, dtype=float)
+        self.assertEqual(int(np.argmax(agent._values((1, 2, 3, 1, 2, 1, 1)))), NUM_ACTIONS - 1)
+
+    def test_q_learning_state_sees_the_wall_ahead(self):
+        agent = TabularQLearner()
+        track = make_track()
+        observation = car_on_centerline(track, 500.0, speed=150.0).get_observation(track)
+        near_wall = observation.copy()
+        near_wall[:config.NUM_SENSORS] = 0.05
+        self.assertNotEqual(agent.discretize(near_wall), agent.discretize(observation))
+
+    def test_genetic_benchmark_starts_from_the_grid(self):
+        agent = GeneticAgent(population_size=4, elite_count=1, seed=0)
+        track = make_track()
+        agent.begin_track(SimpleNamespace(track=track))
+        self.assertEqual(agent.start_indices[0], track.index_at(track.length - config.GRID_FRONT_GAP_PX))
+        self.assertEqual({math.copysign(1.0, lateral) for lateral in agent.start_laterals}, {-1.0, 1.0})
 
     def test_race_end_closes_pending_transitions_as_truncations(self):
         track = make_track()
@@ -367,6 +447,9 @@ class RaceFlowTests(unittest.TestCase):
         self.assertFalse(should_auto_start_next_race("POST_RACE", POST_RACE_DELAY_MS - 1))
         self.assertTrue(should_auto_start_next_race("POST_RACE", POST_RACE_DELAY_MS))
         self.assertFalse(should_auto_start_next_race("RACING", POST_RACE_DELAY_MS))
+
+    def test_auto_advance_can_be_disabled(self):
+        self.assertFalse(should_auto_start_next_race("POST_RACE", POST_RACE_DELAY_MS * 10, auto_advance=False))
 
 
 if __name__ == "__main__":

@@ -15,8 +15,14 @@ TOTAL_CARS = CARS_PER_TEAM * NUM_TEAMS
 TARGET_LAPS = 5
 NUM_SIMULATIONS = 50
 NUM_CHECKPOINTS = 50
-SESSION_DURATION_MS = 180000  # 180 Secondi di timeout sessione
+SESSION_DURATION_MS = 180000  # durata minima della sessione (timeout)
+# La sessione si allunga sui tracciati lunghi: deve bastare per TARGET_LAPS giri a questa velocità media.
+# Con un limite fisso di 180 s, su un tracciato di 8487 px (giro teorico 37.5 s) nessuno poteva finire.
+SESSION_MIN_AVERAGE_SPEED_PX = 150.0
 POST_RACE_DELAY_MS = 2000
+GRID_FRONT_GAP_PX = 10.0          # distanza della prima fila dalla linea di partenza
+GRID_LATERAL_FRACTION = 0.45      # offset laterale delle due colonne della griglia (frazione della semi-larghezza)
+AUTO_ADVANCE_DEFAULT = True   # avvio automatico della corsa successiva (attivabile/disattivabile con il tasto A)
 
 # Algoritmi assegnati ai rispettivi Team
 TEAM_ALGORITHMS = [
@@ -101,9 +107,17 @@ FINISH_BONUS = 10.0
 # La quota di reward del compagno dipende da uno stato non osservabile dall'agente e aggiunge rumore
 # ai target TD; la cooperazione è già data dalla condivisione dei parametri tra le due auto del team.
 TEAM_REWARD_SHARE = 0.0
+# Bonus personal best: quando un'auto chiude un settore più velocemente del proprio record su quel tracciato
+# riceve PERSONAL_BEST_REWARD_SCALE * miglioramento relativo (10% più veloce -> 1.0), con tetto
+# PERSONAL_BEST_REWARD_CAP. È solo positivo, sparso e piccolo rispetto al progresso (~16 per settore) e
+# alla terminazione (10): spinge a battere i propri tempi senza poter diventare la fonte principale di reward.
+# Il primo passaggio in un settore non dà bonus (non c'è un riferimento). 0.0 per disattivarlo.
+PERSONAL_BEST_REWARD_SCALE = 10.0
+PERSONAL_BEST_REWARD_CAP = 1.5
 
-# Traiettoria ideale (usata dall'euristico e come riferimento nei log, NON fornita ai modelli che apprendono)
-RACING_LINE_MARGIN_PX = 4.0          # distanza minima tra carrozzeria e muro sulla linea ideale
+# Traiettoria ideale: solo riferimento grafico (tasto L) e metro di valutazione nei log. Nessun agente,
+# euristico compreso, la conosce: è il termine di paragone per capire se la scoprono da soli.
+RACING_LINE_MARGIN_PX = 10.0         # distanza minima tra carrozzeria e muro sulla linea ideale
 RACING_LINE_SPEED_MARGIN = 0.90      # frazione dei limiti di curvatura/frenata usata dal profilo di velocità
 
 # Collisioni tra auto: non letali (rallentamento + penalità a chi tampona). Con collisioni letali la

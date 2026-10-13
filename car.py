@@ -85,6 +85,8 @@ class Car:
         self.terminal_penalty_total = 0.0
         self.collision_penalty_total = 0.0
         self.completion_bonus_total = 0.0
+        self.personal_best_bonus_total = 0.0
+        self.personal_bests_beaten = 0
         self.slipstream_timer = 0
         self.stationary_frames = 0
         self.wrong_way_frames = 0

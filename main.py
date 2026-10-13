@@ -1,5 +1,6 @@
 # main.py
 import sys
+from functools import lru_cache
 
 try:
     import pygame
@@ -37,7 +38,15 @@ screen = pygame.Surface((WIDTH, HEIGHT))
 pygame.display.set_caption("MARL Racing Simulator")
 clock = pygame.time.Clock()
 sim_speed_index = 0
+# La linea ideale è solo un riferimento grafico (tasto L): non entra in osservazioni né reward dei modelli.
 show_racing_line = False
+auto_advance = AUTO_ADVANCE_DEFAULT
+RECORD_COLOR = (190, 90, 255)   # viola "stile F1" per i record assoluti del tracciato
+
+
+@lru_cache(maxsize=None)
+def ui_font(size, bold=False):
+    return pygame.font.SysFont("Arial", size, bold=bold)
 
 
 def viewport():
@@ -154,6 +163,7 @@ def race_settings():
         "num_checkpoints": NUM_CHECKPOINTS,
         "fps": FPS,
         "session_duration_ms": SESSION_DURATION_MS,
+        "session_min_average_speed_px_s": SESSION_MIN_AVERAGE_SPEED_PX,
         "sensor_angles": SENSOR_ANGLES,
         "sensor_ranges": SENSOR_RANGES,
         "lookahead_distances_px": LOOKAHEAD_DISTANCES_PX,
@@ -170,6 +180,8 @@ def race_settings():
         "termination_penalty": TERMINATION_PENALTY,
         "collision_penalty": COLLISION_PENALTY,
         "finish_bonus": FINISH_BONUS,
+        "personal_best_reward_scale": PERSONAL_BEST_REWARD_SCALE,
+        "personal_best_reward_cap": PERSONAL_BEST_REWARD_CAP,
         "team_reward_share": TEAM_REWARD_SHARE,
         "lethal_car_collisions": LETHAL_CAR_COLLISIONS,
     }
@@ -182,6 +194,8 @@ def race_settings():
 
 def finalize_race(sim):
     reason_str = sim.close_race()
+    settings = race_settings()
+    settings["session_limit_ms"] = sim.session_limit_ms
     print_deep_simulation_report(generation_count, sim.cars, reason_str)
 
     for car in sim.cars:
@@ -209,9 +223,10 @@ def finalize_race(sim):
         cars=sim.cars,
         algorithms=TEAM_ALGORITHMS,
         agents=agents,
-        settings=race_settings(),
+        settings=settings,
         seed=RUN_SEED,
         best_lap_time=sim.best_lap_time_race,
+        track_records={"lap": sim.best_lap_holder, "sectors": sim.best_sector_holders},
     )
 
 
@@ -223,12 +238,64 @@ def draw_gate(checkpoint_index, color, width):
     pygame.draw.line(screen, color, (cp[0] + nx * r, cp[1] + ny * r), (cp[0] - nx * r, cp[1] - ny * r), width)
 
 
+def holder_label(holder):
+    if holder is None:
+        return "-"
+    generation = f", sim {holder['generation']}" if holder.get("generation") is not None else ""
+    return f"ID {holder['car_id']:02d} {holder['algorithm']}{generation}"
+
+
+def draw_text_box(text_surfaces, x, y, padding=6, border=RECORD_COLOR):
+    """Riquadro scuro semi-trasparente con le righe date, tenuto dentro lo schermo."""
+    width = max(surface.get_width() for surface in text_surfaces) + 2 * padding
+    height = sum(surface.get_height() for surface in text_surfaces) + 2 * padding
+    x = max(0, min(int(x), WIDTH - width))
+    y = max(0, min(int(y), HEIGHT - height))
+    box = pygame.Surface((width, height), pygame.SRCALPHA)
+    box.fill((15, 15, 15, 200))
+    screen.blit(box, (x, y))
+    pygame.draw.rect(screen, border, (x, y, width, height), 1)
+    line_y = y + padding
+    for surface in text_surfaces:
+        screen.blit(surface, (x + padding, line_y))
+        line_y += surface.get_height()
+
+
+def draw_track_records(sim, x, y):
+    """Record assoluti del tracciato (giro e settori) con il loro detentore."""
+    rows = [ui_font(14, True).render("RECORD TRACCIATO (global best)", True, RECORD_COLOR)]
+    entries = [("Giro", sim.best_lap_holder)] + [(f"S{i + 1}", h) for i, h in enumerate(sim.best_sector_holders)]
+    for label, holder in entries:
+        time_text = f"{holder['time']:6.2f}s" if holder else "   N/D"
+        color = TEAM_COLORS[holder["team_id"]] if holder else (150, 150, 150)
+        rows.append(ui_font(14, label == "Giro").render(f"{label:<4} {time_text}  {holder_label(holder)}", True, color))
+    draw_text_box(rows, x, y)
+
+
+def draw_sector_record_labels(sim):
+    """Accanto al traguardo di ogni settore: miglior tempo del settore e chi l'ha fatto."""
+    r = track.brush_radius
+    for sector, cp_idx in enumerate((IDX_S1, IDX_S2, 0)):
+        holder = sim.best_sector_holders[sector]
+        if holder is None:
+            continue
+        cp = track.checkpoints[cp_idx]
+        nx, ny = track.normal[track.index_at(cp_idx * track.checkpoint_spacing)]
+        text = ui_font(12, True).render(
+            f"S{sector + 1} {holder['time']:.2f}s  ID {holder['car_id']:02d} {holder['algorithm'][:4]}",
+            True, TEAM_COLORS[holder["team_id"]],
+        )
+        # Fuori dalla pista, oltre l'estremità destra del traguardo del settore.
+        draw_text_box([text], cp[0] + nx * (r + 14) - text.get_width() / 2, cp[1] + ny * (r + 14) - 10, padding=3)
+
+
 def draw_race(sim):
     screen.blit(track.surface, (0, 0))
     if track.checkpoints:
         draw_gate(0, (220, 53, 69), 5)
         for cp_idx in (IDX_S1, IDX_S2):
             draw_gate(cp_idx, (0, 255, 255), 4)
+        draw_sector_record_labels(sim)
 
     if show_racing_line and track.racing_points is not None:
         pygame.draw.lines(screen, (255, 170, 0), True, [tuple(p) for p in track.racing_points[::4]], 1)
@@ -241,15 +308,16 @@ def draw_race(sim):
     sorted_cars = sorted(sim.cars, key=lambda car: car.race_progress(track), reverse=True)
 
     row_height = 15
-    panel_x = WIDTH - 300
+    panel_width = 370
+    panel_x = WIDTH - panel_width - 10
     panel_height = 34 + row_height * len(sorted_cars)
-    pygame.draw.rect(screen, (20, 20, 20), (panel_x, 10, 290, panel_height))
-    pygame.draw.rect(screen, (70, 70, 70), (panel_x, 10, 290, panel_height), 2)
+    pygame.draw.rect(screen, (20, 20, 20), (panel_x, 10, panel_width, panel_height))
+    pygame.draw.rect(screen, (70, 70, 70), (panel_x, 10, panel_width, panel_height), 2)
 
-    font_title = pygame.font.SysFont("Arial", 14, bold=True)
-    screen.blit(font_title.render("CLASSIFICA LIVE / GIRI RIM.", True, (255, 255, 255)), (panel_x + 10, 16))
+    font_title = ui_font(14, True)
+    screen.blit(font_title.render("CLASSIFICA LIVE / GIRI RIM. / PERSONAL BEST", True, (255, 255, 255)), (panel_x + 10, 16))
 
-    font_lb = pygame.font.SysFont("Arial", 13)
+    font_lb = ui_font(13)
     for rank, c in enumerate(sorted_cars):
         laps_remaining = max(0, TARGET_LAPS - c.laps)
         if c.termination_reason.startswith("DSQ"): status_text = "DSQ"
@@ -258,26 +326,35 @@ def draw_race(sim):
         if sim.slipstream_flags.get(c.car_id, False) and c.alive: status_text += " +TOW"
 
         info_str = f"{rank+1}. ID {c.car_id:02d} ({TEAM_ALGORITHMS[c.team_id][:4]}): {laps_remaining} laps | {status_text}"
-        screen.blit(font_lb.render(info_str, True, c.color if c.alive else (110, 110, 110)), (panel_x + 10, 38 + rank * row_height))
+        row_y = 38 + rank * row_height
+        screen.blit(font_lb.render(info_str, True, c.color if c.alive else (110, 110, 110)), (panel_x + 10, row_y))
+        personal_lap = sim.personal_best_laps.get(c.car_id)
+        if personal_lap is not None:
+            is_record = sim.best_lap_holder is not None and sim.best_lap_holder["car_id"] == c.car_id
+            pb_text = font_lb.render(f"PB {personal_lap:.2f}s", True, RECORD_COLOR if is_record else (120, 220, 120))
+            screen.blit(pb_text, (panel_x + panel_width - 10 - pb_text.get_width(), row_y))
 
-    font = pygame.font.SysFont("Arial", 20)
-    track_record_str = f"{sim.best_lap_time_track:.2f}s" if math.isfinite(sim.best_lap_time_track) else "N/D"
-    s1, s2, s3 = sim.best_sector_times
-    ui_text = font.render(f"Simulazione {generation_count}/{NUM_SIMULATIONS} | Attive: {sim.active_cars()}/{TOTAL_CARS} | Tempo: {int(sim.session_ms)//1000}s", True, (255, 255, 0))
-    record_text = font.render(f"Lap Record: {track_record_str} | S1: {s1:.2f}s | S2: {s2:.2f}s | S3: {s3:.2f}s", True, (0, 255, 255))
+    font = ui_font(20)
+    ui_text = font.render(f"Simulazione {generation_count}/{NUM_SIMULATIONS} | Attive: {sim.active_cars()}/{TOTAL_CARS} | Tempo: {int(sim.session_ms)//1000}/{int(sim.session_limit_ms)//1000}s", True, (255, 255, 0))
     speed_text = font.render(
         f"Velocità x{SIM_SPEED_OPTIONS[sim_speed_index]} (tasti 1-{len(SIM_SPEED_OPTIONS)}) | L: linea ideale "
         f"({'ON' if show_racing_line else 'OFF'}, giro teorico {track.ideal_lap_time:.2f}s)",
         True, (200, 200, 200),
     )
     screen.blit(ui_text, (20, 20))
-    screen.blit(record_text, (20, 48))
-    screen.blit(speed_text, (20, 76))
+    screen.blit(speed_text, (20, 48))
+    screen.blit(auto_advance_text(), (20, 76))
+    draw_track_records(sim, 20, 104)
+
+
+def auto_advance_text():
+    color = (0, 255, 0) if auto_advance else (255, 140, 0)
+    return ui_font(20).render(f"A: riproduzione automatica {'ON' if auto_advance else 'OFF'}", True, color)
 
 
 def start_next_race():
     global state, post_race_elapsed_ms
-    simulation.start_race()
+    simulation.start_race(generation_count)
     post_race_elapsed_ms = 0
     state = "RACING"
 
@@ -301,10 +378,13 @@ while True:
                 sim_speed_index = speed_keys.index(event.key)
             elif event.key == pygame.K_l:
                 show_racing_line = not show_racing_line
+            elif event.key == pygame.K_a and state != "DRAWING":
+                auto_advance = not auto_advance
+                post_race_elapsed_ms = 0   # riattivandola in pausa, il conto alla rovescia riparte
 
             if event.key == pygame.K_RETURN and state == "DRAWING" and len(track.drawing_points) > 20:
                 if track.finalize():
-                    simulation = RaceSimulation(track, agents, TEAM_ALGORITHMS)
+                    simulation = RaceSimulation(track, agents, TEAM_ALGORITHMS, generation=generation_count)
                     state = "RACING"
                 else:
                     print("Tracciato non valido: ridisegnalo.")
@@ -326,7 +406,7 @@ while True:
 
     if state == "POST_RACE":
         post_race_elapsed_ms += dt
-        if should_auto_start_next_race(state, post_race_elapsed_ms):
+        if should_auto_start_next_race(state, post_race_elapsed_ms, auto_advance):
             start_next_race()
 
     if state == "DRAWING":
@@ -356,15 +436,19 @@ while True:
 
     elif state == "POST_RACE":
         screen.blit(track.surface, (0, 0))
+        draw_track_records(simulation, 20, 20)
         pygame.draw.rect(screen, (15, 15, 15), (WIDTH//2 - 250, HEIGHT//2 - 70, 500, 140))
         pygame.draw.rect(screen, (255, 255, 255), (WIDTH//2 - 250, HEIGHT//2 - 70, 500, 140), 2)
 
-        f_menu = pygame.font.SysFont("Arial", 18, bold=True)
+        f_menu = ui_font(18, True)
         txt_gen = f_menu.render(f"Simulazione {generation_count - 1} COMPLETATA", True, (0, 255, 0))
         txt_opt1 = f_menu.render("Premi R per RIDISEGNARE un nuovo tracciato", True, (255, 255, 255))
-        seconds_left = max(0.0, (POST_RACE_DELAY_MS - post_race_elapsed_ms) / 1000.0)
-        txt_opt2 = f_menu.render(f"Prossima corsa automatica tra {seconds_left:.1f}s", True, (255, 255, 255))
-        txt_opt3 = f_menu.render("SPAZIO: subito | ESC: termina", True, (255, 255, 255))
+        if auto_advance:
+            seconds_left = max(0.0, (POST_RACE_DELAY_MS - post_race_elapsed_ms) / 1000.0)
+            txt_opt2 = f_menu.render(f"Prossima corsa automatica tra {seconds_left:.1f}s (A: pausa)", True, (255, 255, 255))
+        else:
+            txt_opt2 = f_menu.render("Riproduzione automatica OFF (A: riattiva)", True, (255, 140, 0))
+        txt_opt3 = f_menu.render("SPAZIO: avvia subito | ESC: termina", True, (255, 255, 255))
 
         screen.blit(txt_gen, (WIDTH//2 - 140, HEIGHT//2 - 45))
         screen.blit(txt_opt1, (WIDTH//2 - 210, HEIGHT//2 - 5))

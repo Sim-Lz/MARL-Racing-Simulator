@@ -17,7 +17,6 @@ from team import Team
 
 IDX_S1 = int(NUM_CHECKPOINTS * 0.33)
 IDX_S2 = int(NUM_CHECKPOINTS * 0.67)
-GRID_FRONT_GAP_PX = 10.0
 GRID_ROW_SPACING_PX = 26.0
 SAME_TRACK_SECTION_PX = 40.0
 # Gli episodi fantasma hanno uno "slot" proprio (car_id + offset): possono girare in parallelo all'auto in
@@ -44,6 +43,12 @@ def create_agents(algorithms=TEAM_ALGORITHMS):
     return agents
 
 
+def session_limit_ms(track):
+    """Durata della sessione: almeno SESSION_DURATION_MS, di più se il tracciato è lungo."""
+    needed_ms = 1000.0 * TARGET_LAPS * track.length / SESSION_MIN_AVERAGE_SPEED_PX
+    return max(float(SESSION_DURATION_MS), needed_ms)
+
+
 def unique_agents(agents):
     seen = {}
     for car_id, agent in agents.items():
@@ -52,31 +57,42 @@ def unique_agents(agents):
 
 
 class RaceSimulation:
-    def __init__(self, track, agents, algorithms=TEAM_ALGORITHMS):
+    def __init__(self, track, agents, algorithms=TEAM_ALGORITHMS, generation=None):
         self.track = track
         self.agents = agents
         self.algorithms = algorithms
         self.total_cars = len(algorithms) * CARS_PER_TEAM
         self.cars = []
         self.teams = []
-        # Record del tracciato (persistono tra le corse sullo stesso tracciato)
+        # Record del tracciato (persistono tra le corse sullo stesso tracciato). I detentori sono dict
+        # {"time", "car_id", "team_id", "algorithm", "generation"} oppure None.
         self.best_lap_time_track = float("inf")
         self.best_sector_times = [float("inf")] * 3
+        self.best_lap_holder = None
+        self.best_sector_holders = [None] * 3
+        # Record personali per auto (car_id): settori e giro, sullo stesso tracciato.
+        self.personal_best_sectors = {}
+        self.personal_best_laps = {}
+        self.generation = None
+        self.session_limit_ms = session_limit_ms(track)
         for agent, _ in unique_agents(self.agents):
             agent.begin_track(self)
-        self.start_race()
+        self.start_race(generation)
 
     # ------------------------------------------------------------------ setup
-    def start_race(self):
+    def start_race(self, generation=None):
+        self.generation = generation
         self.session_ms = 0.0
         self.frame = 0
         self.race_finished = False
         self.winner_info = ""
         self.best_lap_time_race = float("inf")
         self.slipstream_flags = {}
+        self.ghost_slipstream = {}
         self._pending = {}
         self._collision_cooldown = {}
         self._previous_progress = {}
+        self._personal_best_improvements = {}
         self.ghosts = {}
         self._respawn_due = {}
         self._spawn_cars()
@@ -90,7 +106,7 @@ class RaceSimulation:
 
     def _spawn_cars(self):
         track = self.track
-        offset = track.brush_radius * 0.45
+        offset = track.brush_radius * GRID_LATERAL_FRACTION
         side_by_side = (
             offset + CAR_HALF_WIDTH + 2.0 <= track.brush_radius
             and 2.0 * offset >= CAR_COLLISION_DISTANCE + 2.0
@@ -123,43 +139,56 @@ class RaceSimulation:
         self._previous_progress = {car.car_id: car.progress_px for car in self.cars}
 
     # ------------------------------------------------------------------ percezione
-    def _update_slipstream(self):
-        flags = {car.car_id: False for car in self.cars if car.alive}
-        for car_a in self.cars:
-            if not car_a.alive:
+    # I fantasmi degli agenti con ghost_sees_race_traffic percepiscono le auto in gara (traffico, scia e
+    # collisioni "virtuali" che toccano solo il fantasma): senza, quasi tutta l'esperienza di addestramento
+    # arrivava da un mondo senza altre auto e in gara (partenza in gruppo) le reti erano fuori distribuzione.
+    # Le auto in gara non vedono mai i fantasmi: la corsa non cambia.
+    def _interacting_ghosts(self):
+        return [
+            ghost for ghost in self.ghosts.values()
+            if ghost.alive and self.agents[ghost.car_id].ghost_sees_race_traffic
+        ]
+
+    @staticmethod
+    def _in_slipstream(car_a, others):
+        for car_b in others:
+            if car_b is car_a:
                 continue
-            for car_b in self.cars:
-                if not car_b.alive or car_b is car_a:
-                    continue
-                dx, dy = car_b.x - car_a.x, car_b.y - car_a.y
-                dist = math.hypot(dx, dy)
-                if 15.0 < dist < 120.0:
-                    angle_diff = abs(math.degrees(math.atan2(dy, dx)) % 360 - car_a.angle)
-                    if min(angle_diff, 360 - angle_diff) < 22.5:
-                        flags[car_a.car_id] = True
-                        break
-        self.slipstream_flags = flags
+            dx, dy = car_b.x - car_a.x, car_b.y - car_a.y
+            dist = math.hypot(dx, dy)
+            if 15.0 < dist < 120.0:
+                angle_diff = abs(math.degrees(math.atan2(dy, dx)) % 360 - car_a.angle)
+                if min(angle_diff, 360 - angle_diff) < 22.5:
+                    return True
+        return False
+
+    def _update_slipstream(self):
+        racing = [car for car in self.cars if car.alive]
+        self.slipstream_flags = {car.car_id: self._in_slipstream(car, racing) for car in racing}
+        self.ghost_slipstream = {ghost.slot: self._in_slipstream(ghost, racing) for ghost in self._interacting_ghosts()}
 
     def _update_traffic(self):
-        alive = [car for car in self.cars if car.alive]
-        if len(alive) < 2:
-            for car in alive:
-                car.traffic_features = (0.0, 0.0, 0.0)
+        racing = [car for car in self.cars if car.alive]
+        observers = racing + self._interacting_ghosts()
+        if not racing:
             return
-        positions = np.array([(car.x, car.y) for car in alive])
-        headings = np.radians([car.angle for car in alive])
-        speeds = np.array([car.speed_px for car in alive])
+        positions = np.array([(car.x, car.y) for car in racing])
+        headings = np.radians([car.angle for car in racing])
+        speeds = np.array([car.speed_px for car in racing])
         cone = math.radians(TRAFFIC_CONE_DEG)
-        for i, car in enumerate(alive):
-            delta = positions - positions[i]
+        for car in observers:
+            heading = math.radians(car.angle)
+            delta = positions - (car.x, car.y)
             distance = np.hypot(delta[:, 0], delta[:, 1])
-            bearing = (np.arctan2(delta[:, 1], delta[:, 0]) - headings[i] + np.pi) % (2.0 * np.pi) - np.pi
+            bearing = (np.arctan2(delta[:, 1], delta[:, 0]) - heading + np.pi) % (2.0 * np.pi) - np.pi
             candidates = (distance > 0.0) & (distance < TRAFFIC_RANGE_PX) & (np.abs(bearing) < cone)
+            if car in racing:
+                candidates[racing.index(car)] = False
             if not candidates.any():
                 car.traffic_features = (0.0, 0.0, 0.0)
                 continue
             nearest = int(np.flatnonzero(candidates)[np.argmin(distance[candidates])])
-            closing = (speeds[i] - speeds[nearest] * math.cos(headings[nearest] - headings[i])) / MAX_SPEED_PX
+            closing = (car.speed_px - speeds[nearest] * math.cos(headings[nearest] - heading)) / MAX_SPEED_PX
             car.traffic_features = (
                 float(1.0 - distance[nearest] / TRAFFIC_RANGE_PX),
                 float(max(-1.0, min(1.0, closing))),
@@ -192,8 +221,10 @@ class RaceSimulation:
                 index = (index - int(RESPAWN_BACKOFF_PX / track.step)) % len(track.center)
             agent.begin_episode(slot)
             index = agent.training_spawn_index(slot, index, track)
+            lateral = agent.training_spawn_lateral(slot, track)
             heading = math.degrees(math.atan2(track.tangent[index, 1], track.tangent[index, 0]))
-            ghost = Car(owner.car_id, owner.team_id, owner.index_in_team, track.center[index], heading, owner.color)
+            position = track.center[index] + track.normal[index] * lateral
+            ghost = Car(owner.car_id, owner.team_id, owner.index_in_team, position, heading, owner.color)
             ghost.slot = slot
             ghost.is_ghost = True
             ghost.decision_interval = owner.decision_interval
@@ -234,7 +265,10 @@ class RaceSimulation:
         progress_delta = {}
         finished = set()
         for car in active:
-            slipstream = False if car.is_ghost else self.slipstream_flags.get(car.car_id, False)
+            if car.is_ghost:
+                slipstream = self.ghost_slipstream.get(car.slot, False)
+            else:
+                slipstream = self.slipstream_flags.get(car.car_id, False)
             car.update(actions[car.slot], track, slipstream)
             progress_delta[car.slot] = car.update_track_position(track)
             if car.alive:
@@ -253,6 +287,7 @@ class RaceSimulation:
                 expired.add(ghost.slot)
 
         collisions_at_fault = self._resolve_car_collisions(racing)
+        ghost_collisions_at_fault = self._resolve_ghost_collisions(racing)
         self._count_overtakes()
 
         rewards = {}
@@ -265,8 +300,11 @@ class RaceSimulation:
                 progress_delta[car.slot] / track.checkpoint_spacing,
                 SIM_DT_MS,
                 terminated=just_died,
-                collisions_at_fault=collisions_at_fault.get(car.car_id, 0) if not car.is_ghost else 0,
+                collisions_at_fault=(
+                    ghost_collisions_at_fault.get(car.slot, 0) if car.is_ghost else collisions_at_fault.get(car.car_id, 0)
+                ),
                 finished=car.slot in finished,
+                personal_best_improvements=self._personal_best_improvements.pop(car.slot, ()),
             )
             if car.is_ghost:
                 owner = self.cars[car.car_id]
@@ -290,6 +328,7 @@ class RaceSimulation:
                 car.collision_penalty_total += terms.collision_penalty
                 car.terminal_penalty_total += terms.termination_penalty
                 car.completion_bonus_total += terms.finish_bonus
+                car.personal_best_bonus_total += terms.personal_best_bonus
                 car.individual_reward_total += terms.total
                 car.cumulative_reward += shared[car.car_id]
                 self._pending[car.slot]["reward"] += shared[car.car_id]
@@ -350,14 +389,13 @@ class RaceSimulation:
                 sector = {IDX_S1: 0, IDX_S2: 1, 0: 2}[index]
                 sector_time = (self.session_ms - car.sector_timer_start) / 1000.0
                 car.sector_timer_start = self.session_ms
-                self.best_sector_times[sector] = min(self.best_sector_times[sector], sector_time)
+                self._record_sector(car, sector, sector_time)
             if index == 0:
                 car.laps += 1
                 lap_time = max(0.5, (self.session_ms - car.last_lap_timer) / 1000.0)
                 car.last_lap_timer = self.session_ms
                 car.lap_times.append(lap_time)
-                self.best_lap_time_race = min(self.best_lap_time_race, lap_time)
-                self.best_lap_time_track = min(self.best_lap_time_track, lap_time)
+                self._record_lap(car, lap_time)
                 if car.laps >= TARGET_LAPS and not self.race_finished:
                     self.race_finished = True
                     self.winner_info = f"Vettura {car.car_id} ({self.algorithms[car.team_id]})"
@@ -365,6 +403,32 @@ class RaceSimulation:
                     finished = True
         car.next_checkpoint = (car.checkpoints_passed_total + 1) % NUM_CHECKPOINTS
         return finished
+
+    def _holder(self, car, time_s):
+        return {
+            "time": time_s, "car_id": car.car_id, "team_id": car.team_id,
+            "algorithm": self.algorithms[car.team_id], "generation": self.generation,
+        }
+
+    def _record_sector(self, car, sector, sector_time):
+        """Aggiorna record globale e personale del settore; il miglioramento personale alimenta il bonus."""
+        if sector_time < self.best_sector_times[sector]:
+            self.best_sector_times[sector] = sector_time
+            self.best_sector_holders[sector] = self._holder(car, sector_time)
+        personal = self.personal_best_sectors.setdefault(car.car_id, [float("inf")] * 3)
+        if sector_time < personal[sector]:
+            if math.isfinite(personal[sector]):
+                improvement = (personal[sector] - sector_time) / personal[sector]
+                self._personal_best_improvements.setdefault(car.slot, []).append(improvement)
+                car.personal_bests_beaten += 1
+            personal[sector] = sector_time
+
+    def _record_lap(self, car, lap_time):
+        self.best_lap_time_race = min(self.best_lap_time_race, lap_time)
+        if lap_time < self.best_lap_time_track:
+            self.best_lap_time_track = lap_time
+            self.best_lap_holder = self._holder(car, lap_time)
+        self.personal_best_laps[car.car_id] = min(self.personal_best_laps.get(car.car_id, float("inf")), lap_time)
 
     def _resolve_car_collisions(self, active):
         at_fault = {}
@@ -391,6 +455,29 @@ class RaceSimulation:
                 behind.collisions_caused += 1
                 ahead.collisions_suffered += 1
                 at_fault[behind.car_id] = at_fault.get(behind.car_id, 0) + 1
+        return at_fault
+
+    def _resolve_ghost_collisions(self, racing):
+        """Contatti fantasma-auto in gara con le stesse regole delle collisioni reali, ma solo il fantasma
+        rallenta e paga la penalità (se tampona): l'auto in gara non se ne accorge."""
+        at_fault = {}
+        length = self.track.length
+        for ghost in self._interacting_ghosts():
+            for car in racing:
+                if not car.alive or math.hypot(ghost.x - car.x, ghost.y - car.y) >= CAR_COLLISION_DISTANCE:
+                    continue
+                gap = (ghost.progress_px - car.progress_px + length / 2.0) % length - length / 2.0
+                if abs(gap) > SAME_TRACK_SECTION_PX:
+                    continue
+                pair = (ghost.slot, car.car_id)
+                if self.frame - self._collision_cooldown.get(pair, -COLLISION_COOLDOWN_FRAMES) < COLLISION_COOLDOWN_FRAMES:
+                    continue
+                self._collision_cooldown[pair] = self.frame
+                if gap < 0:
+                    ghost.speed_px *= COLLISION_SPEED_FACTOR_AT_FAULT
+                    at_fault[ghost.slot] = at_fault.get(ghost.slot, 0) + 1
+                else:
+                    ghost.speed_px *= COLLISION_SPEED_FACTOR_VICTIM
         return at_fault
 
     def _count_overtakes(self):
@@ -430,7 +517,7 @@ class RaceSimulation:
         return sum(1 for car in self.cars if car.alive)
 
     def is_over(self):
-        return self.race_finished or self.active_cars() == 0 or self.session_ms >= SESSION_DURATION_MS
+        return self.race_finished or self.active_cars() == 0 or self.session_ms >= self.session_limit_ms
 
     def close_race(self):
         """Chiude le transizioni pendenti come troncamenti, notifica gli agenti e ritorna la motivazione."""

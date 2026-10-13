@@ -43,6 +43,7 @@ class RaceLogger:
         settings,
         seed,
         best_lap_time,
+        track_records=None,
     ):
         centerline = [[float(x), float(y)] for x, y in track.drawing_points]
         checkpoints = [[float(x), float(y)] for x, y in track.checkpoints]
@@ -93,6 +94,8 @@ class RaceLogger:
                     "terminal_penalty": car.terminal_penalty_total,
                     "collision_penalty": getattr(car, "collision_penalty_total", 0.0),
                     "completion_bonus": car.completion_bonus_total,
+                    "personal_best_bonus": getattr(car, "personal_best_bonus_total", 0.0),
+                    "personal_bests_beaten": getattr(car, "personal_bests_beaten", 0),
                     "collisions_caused": getattr(car, "collisions_caused", 0),
                     "collisions_suffered": getattr(car, "collisions_suffered", 0),
                     "overtakes": car.overtakes_performed,
@@ -114,6 +117,7 @@ class RaceLogger:
             "reason": reason,
             "duration_seconds": duration_ms / 1000.0,
             "best_lap_seconds": best_lap_time if math.isfinite(best_lap_time) else None,
+            "track_records": track_records,
             "settings": settings,
             "cars": car_records,
         }

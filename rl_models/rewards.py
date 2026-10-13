@@ -6,13 +6,16 @@ Principi:
 - ogni terminazione anticipata (crash, stallo, contromano, nessun progresso) ha la stessa penalità,
   così nessuna modalità di uscita è "più conveniente" delle altre;
 - le collisioni tra auto penalizzano solo chi tampona;
-- nessuna penalità temporale di default (con la terminazione creerebbe un incentivo a uscire presto).
+- nessuna penalità temporale di default (con la terminazione creerebbe un incentivo a uscire presto);
+- un piccolo bonus quando l'auto migliora il proprio record di settore (solo positivo e con tetto).
 """
 from dataclasses import dataclass
 
 from config import (
     COLLISION_PENALTY,
     FINISH_BONUS,
+    PERSONAL_BEST_REWARD_CAP,
+    PERSONAL_BEST_REWARD_SCALE,
     PROGRESS_REWARD_SCALE,
     TERMINATION_PENALTY,
     TIME_PENALTY_PER_SECOND,
@@ -26,6 +29,7 @@ class RewardTerms:
     collision_penalty: float = 0.0
     termination_penalty: float = 0.0
     finish_bonus: float = 0.0
+    personal_best_bonus: float = 0.0
 
     @property
     def total(self):
@@ -35,6 +39,7 @@ class RewardTerms:
             - self.collision_penalty
             - self.termination_penalty
             + self.finish_bonus
+            + self.personal_best_bonus
         )
 
 
@@ -44,12 +49,18 @@ def calculate_step_reward(
     terminated=False,
     collisions_at_fault=0,
     finished=False,
+    personal_best_improvements=(),
 ):
-    """progress_checkpoints: avanzamento del frame espresso in checkpoint (può essere negativo)."""
+    """progress_checkpoints: avanzamento del frame espresso in checkpoint (può essere negativo).
+    personal_best_improvements: miglioramenti relativi (0-1) dei record personali di settore battuti nel frame."""
     return RewardTerms(
         progress=PROGRESS_REWARD_SCALE * progress_checkpoints,
         time_penalty=TIME_PENALTY_PER_SECOND * elapsed_ms / 1000.0,
         collision_penalty=COLLISION_PENALTY * collisions_at_fault,
         termination_penalty=TERMINATION_PENALTY if terminated else 0.0,
         finish_bonus=FINISH_BONUS if finished else 0.0,
+        personal_best_bonus=sum(
+            min(PERSONAL_BEST_REWARD_CAP, PERSONAL_BEST_REWARD_SCALE * max(0.0, improvement))
+            for improvement in personal_best_improvements
+        ),
     )

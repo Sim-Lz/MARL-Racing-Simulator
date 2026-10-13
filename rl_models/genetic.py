@@ -2,7 +2,7 @@
 import numpy as np
 
 from car import controls_to_action
-from config import OBS_TRAFFIC_PROXIMITY, OBSERVATION_SIZE
+from config import GRID_FRONT_GAP_PX, GRID_LATERAL_FRACTION, OBS_TRAFFIC_PROXIMITY, OBSERVATION_SIZE
 from rl_models.base import Agent
 
 HIDDEN_UNITS = 16
@@ -83,6 +83,11 @@ class GeneticAgent(Agent):
     miglior individuo non può peggiorare.
     (Prima ogni valutazione partiva da un punto diverso: la fitness misurava il punto di partenza e la
     popolazione è rimasta ferma per 355 generazioni.)
+    Le partenze del benchmark replicano la griglia: la prima è la pole position, tutte sono spostate
+    lateralmente come le due colonne della griglia. Con partenze solo sulla mezzeria il miglior individuo
+    non aveva mai visto una partenza decentrata e in gara restava fermo in griglia (52% di DSQ_STALLED).
+    I fantasmi del genetico restano isolati (ghost_sees_race_traffic = False): il traffico renderebbe la
+    fitness rumorosa e non confrontabile tra individui.
     """
 
     algorithm = "GENETIC"
@@ -91,6 +96,7 @@ class GeneticAgent(Agent):
     training_ghosts_per_car = 3
     max_training_episode_s = 10.0
     benchmark_starts = 4
+    ghost_sees_race_traffic = False
 
     def __init__(self, population_size=16, elite_count=2, tournament_size=3, seed=None):
         self.rng = np.random.default_rng(seed)
@@ -108,6 +114,7 @@ class GeneticAgent(Agent):
         self.best_fitness = float("-inf")
         self.last_mutation_norm = 0.0
         self.start_indices = [0] * self.benchmark_starts
+        self.start_laterals = [0.0] * self.benchmark_starts
 
     def _new_individual(self):
         network = GeneticNetwork(self.rng)
@@ -122,9 +129,12 @@ class GeneticAgent(Agent):
 
     def begin_track(self, sim):
         # Nuovo tracciato: nuovo benchmark, tutte le fitness vanno ricalcolate (elitari compresi).
-        count = len(sim.track.center)
-        offset = int(self.rng.integers(count))
+        track = sim.track
+        count = len(track.center)
+        offset = track.index_at(track.length - GRID_FRONT_GAP_PX)   # pole position
         self.start_indices = [(offset + k * count // self.benchmark_starts) % count for k in range(self.benchmark_starts)]
+        grid_offset = GRID_LATERAL_FRACTION * track.brush_radius
+        self.start_laterals = [grid_offset * (1 if k % 2 == 0 else -1) for k in range(self.benchmark_starts)]
         self.scores = [[None] * self.benchmark_starts for _ in range(self.population_size)]
         self.assignments = {}
 
@@ -145,6 +155,10 @@ class GeneticAgent(Agent):
     def training_spawn_index(self, slot, default_index, track):
         _, _, start = self.assignments.get(slot, (None, None, 0))
         return self.start_indices[start]
+
+    def training_spawn_lateral(self, slot, track):
+        _, _, start = self.assignments.get(slot, (None, None, 0))
+        return self.start_laterals[start]
 
     def end_episode(self, car_id, result):
         generation, index, start = self.assignments.pop(car_id, (None, None, None))

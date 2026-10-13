@@ -14,6 +14,8 @@ from config import (
     OBS_TRACK_HEADING,
     OBS_TRAFFIC_CLOSING,
     OBS_TRAFFIC_PROXIMITY,
+    SENSOR_ANGLES,
+    SENSOR_RANGES,
 )
 from rl_models.base import Agent, exploration_action
 
@@ -22,13 +24,17 @@ HEADING_EDGES = [math.radians(d) for d in (-30, -12, -4, 4, 12, 30)]     # 7 bin
 NEAR_CURVE_EDGES = [-0.25, -0.08, 0.08, 0.25]                            # 5 bin, curva a 50 px (con segno)
 FAR_SHARPNESS_EDGES = [0.15, 0.5]                                        # 3 bin, |curva| a 300 px
 SPEED_EDGES = [0.2, 0.4, 0.6, 0.8]                                       # 5 bin
+FRONT_WALL_EDGES_PX = [40.0, 120.0]                                      # 3 bin, muro davanti (cono ±10°)
+FRONT_CONE = [i for i, angle in enumerate(SENSOR_ANGLES) if abs(angle) <= 10]
 
 
 class TabularQLearner(Agent):
     """Q-learning tabellare con ritorni a n passi.
 
     Stato: offset laterale, errore di direzione, curva imminente (con verso), severità della curva
-    lontana (per anticipare la frenata), velocità e traffico: ~5000 stati al massimo.
+    lontana (per anticipare la frenata), velocità, distanza dal muro davanti e traffico (~15000 stati al
+    massimo, ~1500 visitati in pratica). Senza il muro davanti lo stato non conteneva alcun sensore e il
+    64% delle auto usciva nei primi 8 s, con errori di direzione mediani di 37°.
     Con l'aggiornamento a 1 passo la penalità di uscita risaliva di uno stato ogni volta che veniva
     rivisitato: nelle 50 corse precedenti la tabella non ha mai imparato a frenare prima delle curve
     (5-16 checkpoint per corsa). Con n=3 il segnale copre ~0.15 s per aggiornamento.
@@ -59,12 +65,16 @@ class TabularQLearner(Agent):
             int(np.searchsorted(NEAR_CURVE_EDGES, float(state_vector[OBS_TRACK_HEADING]))),
             int(np.searchsorted(FAR_SHARPNESS_EDGES, abs(float(state_vector[OBS_TRACK_HEADING + 2])))),
             int(np.searchsorted(SPEED_EDGES, float(state_vector[OBS_SPEED]))),
+            int(np.searchsorted(FRONT_WALL_EDGES_PX, min(float(state_vector[i]) * SENSOR_RANGES[i] for i in FRONT_CONE))),
             traffic,
         )
 
     def _values(self, state):
         if state not in self.q_table:
-            self.q_table[state] = np.zeros(NUM_ACTIONS)
+            # Uno stato con traffico mai visto parte dai valori dello stesso stato senza traffico: con zeri
+            # l'argmax era un pareggio tra tutte le azioni e in gruppo (partenza) l'auto guidava a caso.
+            free = state[:-1] + (0,)
+            self.q_table[state] = self.q_table[free].copy() if state[-1] and free in self.q_table else np.zeros(NUM_ACTIONS)
         return self.q_table[state]
 
     def begin_track(self, sim):

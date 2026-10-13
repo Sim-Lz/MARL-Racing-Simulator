@@ -13,6 +13,8 @@ import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 
+START_PHASE_SECONDS = 8.0   # uscite entro questo tempo = partenza in gruppo
+
 
 def load_runs(paths):
     races, tracks = [], {}
@@ -41,7 +43,9 @@ def car_progress(car, track):
 
 def print_algorithm_summary(races, tracks):
     print("\n=== RIEPILOGO PER ALGORITMO (auto in gara, esclusi i respawn di addestramento) ===")
-    header = f"{'ALGORITMO':<16}{'AUTO':>6}{'COMPL%':>8}{'PROGR.':>9}{'GIRI':>7}{'SURV s':>8}{'V-MED':>8}{'COLL.':>7}{'TRAIN/RESP':>12}"
+    print(f"  OUT PART.% = uscite nei primi {START_PHASE_SECONDS:.0f} s | TRAIN/RESP = checkpoint medi per episodio fantasma"
+          " (se molto più alto di PROGR. il modello guida da solo ma non in gara)")
+    header = f"{'ALGORITMO':<16}{'AUTO':>6}{'COMPL%':>8}{'PROGR.':>9}{'GIRI':>7}{'SURV s':>8}{'V-MED':>8}{'COLL.':>7}{'OUT PART.%':>11}{'TRAIN/RESP':>12}"
     print(header)
     print("-" * len(header))
     by_algo = defaultdict(list)
@@ -53,6 +57,7 @@ def print_algorithm_summary(races, tracks):
         completed = sum(1 for car in cars if car.get("completed"))
         respawns = sum(car.get("training_respawns", 0) for car in cars)
         training = sum(car.get("training_progress", 0.0) for car in cars)
+        start_exits = sum(1 for car in cars if car.get("death") and car["death"]["time_seconds"] < START_PHASE_SECONDS)
         print(
             f"{algo:<16}{len(cars):>6}{100.0 * completed / len(cars):>7.1f}%"
             f"{mean([car_progress(car, tracks.get(race['track_id'])) for race, car in entries]):>9.1f}"
@@ -60,6 +65,7 @@ def print_algorithm_summary(races, tracks):
             f"{mean([car.get('survival_seconds') for car in cars]):>8.1f}"
             f"{mean([car.get('average_speed_px_s') for car in cars]):>8.0f}"
             f"{mean([car.get('collisions_caused') for car in cars]):>7.2f}"
+            f"{100.0 * start_exits / len(cars):>10.1f}%"
             f"{(training / respawns if respawns else float('nan')):>12.1f}"
         )
 

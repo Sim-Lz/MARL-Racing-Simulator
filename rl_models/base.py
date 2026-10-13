@@ -33,6 +33,9 @@ class Agent:
     continuous_training_ghost = False
     # Numero di fantasmi contemporanei per auto (episodi indipendenti, utile per valutazioni parallele).
     training_ghosts_per_car = 1
+    # True se i fantasmi percepiscono le auto in gara (traffico, scia, collisioni che toccano solo il
+    # fantasma), così l'esperienza di addestramento somiglia a quella della gara.
+    ghost_sees_race_traffic = True
 
     def begin_track(self, sim):
         """Chiamato quando inizia una serie di corse su un nuovo tracciato."""
@@ -40,6 +43,10 @@ class Agent:
     def training_spawn_index(self, slot, default_index, track):
         """Indice della mezzeria da cui far partire un episodio fantasma (default: poco prima dell'uscita)."""
         return default_index
+
+    def training_spawn_lateral(self, slot, track):
+        """Offset laterale (px, + = destra) dalla mezzeria per lo spawn di un episodio fantasma."""
+        return 0.0
 
     def begin_race(self, car_ids):
         """Chiamato all'inizio di ogni corsa con le auto controllate da questo agente."""
