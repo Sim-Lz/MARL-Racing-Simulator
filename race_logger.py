@@ -94,6 +94,7 @@ class RaceLogger:
                     "terminal_penalty": car.terminal_penalty_total,
                     "collision_penalty": getattr(car, "collision_penalty_total", 0.0),
                     "completion_bonus": car.completion_bonus_total,
+                    "idle_penalty": getattr(car, "idle_penalty_total", 0.0),
                     "personal_best_bonus": getattr(car, "personal_best_bonus_total", 0.0),
                     "personal_bests_beaten": getattr(car, "personal_bests_beaten", 0),
                     "collisions_caused": getattr(car, "collisions_caused", 0),

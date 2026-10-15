@@ -151,6 +151,37 @@ class RewardTests(unittest.TestCase):
         self.assertAlmostEqual(capped, config.PERSONAL_BEST_REWARD_CAP)
         self.assertLess(config.PERSONAL_BEST_REWARD_CAP, TERMINATION_PENALTY)
 
+    def test_collision_penalty_scales_with_impact_speed(self):
+        from simulation import impact_severity
+        behind = SimpleNamespace(speed_px=60.0, angle=0.0)
+        ahead = SimpleNamespace(speed_px=0.0, angle=0.0)
+        self.assertAlmostEqual(impact_severity(behind, ahead), 60.0 / config.COLLISION_FULL_PENALTY_SPEED_PX)
+        behind.speed_px = 400.0
+        self.assertEqual(impact_severity(behind, ahead), 1.0)
+        self.assertEqual(impact_severity(SimpleNamespace(speed_px=100.0, angle=0.0), SimpleNamespace(speed_px=120.0, angle=0.0)), 0.0)
+
+    def test_disqualification_penalty_is_paid_in_advance_with_the_same_total(self):
+        track = make_track()
+        car = car_on_centerline(track, 500.0, speed=0.0)
+        paid = 0.0
+        while car.alive:
+            car.check_disqualifications(track)
+            terms = calculate_step_reward(
+                0.0, 0.0, terminated=not car.alive, idle_penalty=car.dsq_warning_step,
+                termination_paid=car.termination_already_paid() if not car.alive else 0.0,
+            )
+            paid += terms.idle_penalty + terms.termination_penalty
+        self.assertEqual(car.termination_reason, "DSQ_STALLED")
+        self.assertAlmostEqual(paid, TERMINATION_PENALTY, places=6)
+        # Dopo un secondo da fermi l'anticipo pagato è già un terzo della penalità di stallo.
+        moving = car_on_centerline(track, 500.0, speed=0.0)
+        for _ in range(config.FPS):
+            moving.check_disqualifications(track)
+        self.assertAlmostEqual(moving.dsq_warning_paid, TERMINATION_PENALTY / config.STALL_TIMEOUT_S, places=6)
+        moving.speed_px = 100.0
+        moving.check_disqualifications(track)
+        self.assertEqual(moving.dsq_warning_paid, 0.0)   # riparte: la finestra si chiude
+
     def test_team_sharing_is_positive_only_and_not_double_counted(self):
         car_a = SimpleNamespace(car_id=0)
         car_b = SimpleNamespace(car_id=1)
@@ -189,6 +220,17 @@ class AgentTests(unittest.TestCase):
         self.assertNotEqual(agent.act(0, observation) // 3, 2)     # rettilineo: non frena
         observation[config.OBS_TRACK_HEADING:config.OBS_TRACK_HEADING + 3] = (0.3, 1.0, 1.0)
         self.assertEqual(agent.act(0, observation) // 3, 2)        # tornante in arrivo: frena
+
+    def test_heuristic_overtakes_only_where_the_track_is_straight(self):
+        agent = HeuristicController()
+        observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+        observation[:config.NUM_SENSORS] = 1.0
+        observation[OBS_HEADING_COS] = 1.0
+        observation[OBS_SPEED] = 0.5
+        observation[config.OBS_TRAFFIC_PROXIMITY:config.OBS_TRAFFIC_BEARING + 1] = (0.75, 0.3, 0.0)
+        self.assertNotEqual(agent.act(0, observation) // 3, 2)   # rettilineo: tenta il sorpasso, non frena
+        observation[config.OBS_TRACK_HEADING:config.OBS_TRACK_HEADING + 2] = (0.3, -0.1)   # S in arrivo
+        self.assertEqual(agent.act(0, observation) // 3, 2)      # in curva: resta in scia e frena
 
     def test_heuristic_does_not_read_the_racing_line(self):
         track = make_track()
@@ -323,16 +365,18 @@ class SimulationTests(unittest.TestCase):
         track = make_track()
         sim = RaceSimulation(track, create_agents(["HEURISTIC"]), ["HEURISTIC"])
         ahead, behind = sim.cars
-        for car, arc in ((ahead, 505.0), (behind, 500.0)):
+        for car, arc, speed in ((ahead, 505.0, 50.0), (behind, 500.0, 200.0)):
             index = track.index_at(arc)
             car.x, car.y = track.center[index]
-            car.speed_px = 200.0
+            car.speed_px = speed
             car.update_track_position(track, initial=True)
         at_fault = sim._resolve_car_collisions(sim.cars)
 
-        self.assertEqual(at_fault, {behind.car_id: 1})
+        self.assertEqual(set(at_fault), {behind.car_id})
+        self.assertAlmostEqual(at_fault[behind.car_id], 1.0, places=2)   # impatto a 150 px/s: penalità piena
         self.assertTrue(ahead.alive and behind.alive)
-        self.assertLess(behind.speed_px, ahead.speed_px)
+        self.assertAlmostEqual(behind.speed_px, 200.0 * config.COLLISION_SPEED_FACTOR_AT_FAULT)
+        self.assertAlmostEqual(ahead.speed_px, 50.0 * config.COLLISION_SPEED_FACTOR_VICTIM)
 
     def test_eliminated_learners_respawn_as_ghosts_without_affecting_results(self):
         track = make_track()
@@ -364,7 +408,7 @@ class SimulationTests(unittest.TestCase):
         sim._update_traffic()
         self.assertGreater(ghost.traffic_features[0], 0.9)
         self.assertEqual(racer.traffic_features, (0.0, 0.0, 0.0))
-        self.assertEqual(sim._resolve_ghost_collisions([racer]), {ghost.slot: 1})
+        self.assertAlmostEqual(sim._resolve_ghost_collisions([racer])[ghost.slot], 100.0 / config.COLLISION_FULL_PENALTY_SPEED_PX, places=2)
         self.assertAlmostEqual(ghost.speed_px, 200.0 * config.COLLISION_SPEED_FACTOR_AT_FAULT)
         self.assertEqual(racer.speed_px, 100.0)
         self.assertEqual(racer.collisions_suffered, 0)

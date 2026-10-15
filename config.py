@@ -102,7 +102,11 @@ PROGRESS_REWARD_SCALE = 1.0          # reward per checkpoint di avanzamento (50 
 # il discount già premia la velocità, quindi di default è disattivata.
 TIME_PENALTY_PER_SECOND = 0.0
 TERMINATION_PENALTY = 10.0           # identica per crash, stallo, contromano e assenza di progresso
-COLLISION_PENALTY = 2.0              # solo all'auto responsabile (quella che tampona)
+COLLISION_PENALTY = 2.0              # solo all'auto responsabile (quella che tampona), a piena velocità d'impatto
+# La penalità di collisione scala con la velocità d'impatto (velocità di avvicinamento) fino a questo valore:
+# un contatto a passo d'uomo in griglia costa poco, un tamponamento a 150 px/s costa COLLISION_PENALTY.
+# Con una penalità fissa, accelerare dietro un'auto ferma costava subito -2 e il PG ha imparato a restare fermo.
+COLLISION_FULL_PENALTY_SPEED_PX = 150.0
 FINISH_BONUS = 10.0
 # La quota di reward del compagno dipende da uno stato non osservabile dall'agente e aggiunge rumore
 # ai target TD; la cooperazione è già data dalla condivisione dei parametri tra le due auto del team.
@@ -141,6 +145,11 @@ STALL_SPEED_PX = 5.0
 STALL_TIMEOUT_S = 3.0
 WRONG_WAY_TIMEOUT_S = 2.5
 NO_PROGRESS_TIMEOUT_S = 8.0          # deve avanzare di almeno un checkpoint in questo intervallo
+# Penalità di squalifica "anticipata": mentre un'auto è ferma (o non avanza da più di NO_PROGRESS_GRACE_S)
+# paga a ogni frame una quota della TERMINATION_PENALTY, e alla squalifica paga solo il resto. Il costo totale
+# di una squalifica resta TERMINATION_PENALTY, ma diventa visibile subito: prima arrivava 3-8 s dopo, oltre
+# l'orizzonte di gamma/GAE (peso ~0.01 dopo 3 s per il PG), e restare fermi sembrava gratis.
+NO_PROGRESS_GRACE_S = 3.0
 
 # Dinamica del Veicolo e Limiti di Tolleranza
 MAX_STEER_ANGLE = 5.0       # Angolo massimo di sterzata per frame (gradi) a MIN_SPEED_PX

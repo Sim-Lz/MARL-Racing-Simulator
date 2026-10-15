@@ -43,6 +43,13 @@ def create_agents(algorithms=TEAM_ALGORITHMS):
     return agents
 
 
+def impact_severity(behind, ahead):
+    """Gravità di un tamponamento in [0, 1]: velocità di avvicinamento / COLLISION_FULL_PENALTY_SPEED_PX."""
+    relative_heading = math.radians(ahead.angle - behind.angle)
+    closing = behind.speed_px - ahead.speed_px * math.cos(relative_heading)
+    return max(0.0, min(1.0, closing / COLLISION_FULL_PENALTY_SPEED_PX))
+
+
 def session_limit_ms(track):
     """Durata della sessione: almeno SESSION_DURATION_MS, di più se il tracciato è lungo."""
     needed_ms = 1000.0 * TARGET_LAPS * track.length / SESSION_MIN_AVERAGE_SPEED_PX
@@ -305,7 +312,10 @@ class RaceSimulation:
                 ),
                 finished=car.slot in finished,
                 personal_best_improvements=self._personal_best_improvements.pop(car.slot, ()),
+                idle_penalty=car.dsq_warning_step,
+                termination_paid=car.termination_already_paid() if just_died else 0.0,
             )
+            car.dsq_warning_step = 0.0
             if car.is_ghost:
                 owner = self.cars[car.car_id]
                 owner.training_reward_total += terms.total
@@ -327,6 +337,7 @@ class RaceSimulation:
                 car.time_penalty_total += terms.time_penalty
                 car.collision_penalty_total += terms.collision_penalty
                 car.terminal_penalty_total += terms.termination_penalty
+                car.idle_penalty_total += terms.idle_penalty
                 car.completion_bonus_total += terms.finish_bonus
                 car.personal_best_bonus_total += terms.personal_best_bonus
                 car.individual_reward_total += terms.total
@@ -446,6 +457,7 @@ class RaceSimulation:
                     continue
                 self._collision_cooldown[pair] = self.frame
                 behind, ahead = (car_a, car_b) if gap < 0 else (car_b, car_a)
+                severity = impact_severity(behind, ahead)
                 if LETHAL_CAR_COLLISIONS:
                     car_a.kill("COLLISION")
                     car_b.kill("COLLISION")
@@ -454,7 +466,7 @@ class RaceSimulation:
                     ahead.speed_px *= COLLISION_SPEED_FACTOR_VICTIM
                 behind.collisions_caused += 1
                 ahead.collisions_suffered += 1
-                at_fault[behind.car_id] = at_fault.get(behind.car_id, 0) + 1
+                at_fault[behind.car_id] = at_fault.get(behind.car_id, 0.0) + severity
         return at_fault
 
     def _resolve_ghost_collisions(self, racing):
@@ -474,8 +486,9 @@ class RaceSimulation:
                     continue
                 self._collision_cooldown[pair] = self.frame
                 if gap < 0:
+                    severity = impact_severity(ghost, car)
                     ghost.speed_px *= COLLISION_SPEED_FACTOR_AT_FAULT
-                    at_fault[ghost.slot] = at_fault.get(ghost.slot, 0) + 1
+                    at_fault[ghost.slot] = at_fault.get(ghost.slot, 0.0) + severity
                 else:
                     ghost.speed_px *= COLLISION_SPEED_FACTOR_VICTIM
         return at_fault

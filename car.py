@@ -85,6 +85,9 @@ class Car:
         self.terminal_penalty_total = 0.0
         self.collision_penalty_total = 0.0
         self.completion_bonus_total = 0.0
+        self.idle_penalty_total = 0.0
+        self.dsq_warning_step = 0.0      # quota di penalità di squalifica pagata in questo frame
+        self.dsq_warning_paid = 0.0      # quota già pagata nella finestra di stallo/mancato progresso in corso
         self.personal_best_bonus_total = 0.0
         self.personal_bests_beaten = 0
         self.slipstream_timer = 0
@@ -274,6 +277,8 @@ class Car:
         else:
             self.no_progress_frames += 1
 
+        self._update_dsq_warning()
+
         if self.stationary_frames >= STALL_TIMEOUT_S * FPS:
             self.kill("DSQ_STALLED")
         elif self.wrong_way_frames >= WRONG_WAY_TIMEOUT_S * FPS:
@@ -281,6 +286,22 @@ class Car:
         elif self.no_progress_frames >= NO_PROGRESS_TIMEOUT_S * FPS:
             self.kill("DSQ_NO_PROGRESS")
         return not self.alive
+
+    def _update_dsq_warning(self):
+        """Quota per frame della penalità di squalifica, spalmata sulla finestra che porterebbe alla squalifica."""
+        stall_rate = TERMINATION_PENALTY / (STALL_TIMEOUT_S * FPS) if self.stationary_frames > 0 else 0.0
+        slow_window = (NO_PROGRESS_TIMEOUT_S - NO_PROGRESS_GRACE_S) * FPS
+        slow_rate = TERMINATION_PENALTY / slow_window if self.no_progress_frames > NO_PROGRESS_GRACE_S * FPS else 0.0
+        step = max(stall_rate, slow_rate)
+        if step == 0.0:
+            self.dsq_warning_paid = 0.0   # finestra chiusa: l'auto si muove e avanza, nulla da restituire
+        step = min(step, max(0.0, TERMINATION_PENALTY - self.dsq_warning_paid))
+        self.dsq_warning_step = step
+        self.dsq_warning_paid += step
+
+    def termination_already_paid(self):
+        """Parte della penalità di terminazione già pagata come anticipo (solo per le squalifiche)."""
+        return self.dsq_warning_paid if self.termination_reason.startswith("DSQ") else 0.0
 
     def average_speed(self):
         return self.speed_sum / max(1, self.total_steps)

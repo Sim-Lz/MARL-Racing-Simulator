@@ -22,6 +22,9 @@ from race_logger import RaceLogger
 from race_flow import should_auto_start_next_race, should_exit_early
 
 pygame.init()
+# Reti piccole e batch piccoli: con i thread di default (uno per core) torch passa più tempo a sincronizzarli
+# che a calcolare. Con un solo thread i test di DQN/PG sono ~7 volte più veloci.
+torch.set_num_threads(1)
 
 
 def initial_window_size():
@@ -179,6 +182,8 @@ def race_settings():
         "time_penalty_per_second": TIME_PENALTY_PER_SECOND,
         "termination_penalty": TERMINATION_PENALTY,
         "collision_penalty": COLLISION_PENALTY,
+        "collision_full_penalty_speed_px_s": COLLISION_FULL_PENALTY_SPEED_PX,
+        "no_progress_grace_s": NO_PROGRESS_GRACE_S,
         "finish_bonus": FINISH_BONUS,
         "personal_best_reward_scale": PERSONAL_BEST_REWARD_SCALE,
         "personal_best_reward_cap": PERSONAL_BEST_REWARD_CAP,

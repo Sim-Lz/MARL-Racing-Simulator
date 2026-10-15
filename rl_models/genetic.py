@@ -93,7 +93,9 @@ class GeneticAgent(Agent):
     algorithm = "GENETIC"
     uses_training_respawn = True
     continuous_training_ghost = True
-    training_ghosts_per_car = 3
+    # Valutazioni in parallelo: con 3 fantasmi per auto la popolazione evolveva di ~0.7 generazioni per corsa
+    # su un tracciato corto e il miglior individuo non superava la prima curva dopo 12 corse.
+    training_ghosts_per_car = 6
     max_training_episode_s = 10.0
     benchmark_starts = 4
     ghost_sees_race_traffic = False

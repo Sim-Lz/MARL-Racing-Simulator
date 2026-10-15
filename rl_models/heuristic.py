@@ -54,11 +54,14 @@ class HeuristicController(Agent):
     algorithm = "HEURISTIC"
     curvature_margin = 0.85          # frazione della capacità di sterzo usata in curva
     braking_margin = 0.8             # frazione della decelerazione usata per pianificare la frenata
+    chicane_factor = 2.2             # curvatura di picco / media stimata quando la svolta cambia verso
+    chicane_min_turn_rad = 0.1
     speed_hysteresis = 3.0
     wall_clearance_px = 9.0
     steer_threshold = 0.3            # frazione della sterzata massima sotto la quale si va dritti
     pass_bias_rad = 0.12             # spostamento angolare del punto inseguito durante il sorpasso
     pass_room_px = 18.0
+    pass_max_bend_rad = 0.25         # svolta massima entro 150 px per tentare il sorpasso
     saturation = 0.98                # |sin| oltre cui la direzione della pista è considerata satura
     tight_bend_rad = 0.6             # svolta (entro 150 px) oltre la quale si insegue solo il punto vicino
 
@@ -73,16 +76,22 @@ class HeuristicController(Agent):
         """Velocità ammessa ora: limiti di curvatura dei tratti davanti, raggiungibili frenando, e muro frontale."""
         heading_error = math.atan2(float(observation[OBS_HEADING_SIN]), float(observation[OBS_HEADING_COS]))
         previous_angle, previous_distance = -heading_error, 0.0   # direzione della pista qui, rispetto all'auto
+        previous_turn = 0.0
         allowed = MAX_SPEED_PX
         for k, distance in enumerate(LOOKAHEAD_DISTANCES_PX):
             value = float(observation[OBS_TRACK_HEADING + k])
             # Oltre ±90° l'osservazione satura: per prudenza la svolta si considera un tornante (±180°).
             angle = math.copysign(math.pi, value) if abs(value) >= self.saturation else self._angle(value)
-            curvature = abs(angle - previous_angle) / max(1.0, distance - previous_distance)
+            turn = angle - previous_angle
+            curvature = abs(turn) / max(1.0, distance - previous_distance)
+            # In una chicane (la svolta cambia verso tra due tratti) la media sul tratto mescola due curve opposte
+            # e sottostima il picco: sul tracciato aef0ebdd l'euristico arrivava a ~200 px/s in una S di raggio 48 px.
+            if turn * previous_turn < 0.0 and min(abs(turn), abs(previous_turn)) > self.chicane_min_turn_rad:
+                curvature *= self.chicane_factor
             limit = math.sqrt(self.curvature_margin * CURVATURE_CAPACITY / max(curvature, 1e-9))
             limit = max(MIN_SPEED_PX, min(MAX_SPEED_PX, limit))
             allowed = min(allowed, math.sqrt(limit ** 2 + 2.0 * DECELERATION * self.braking_margin * previous_distance))
-            previous_angle, previous_distance = angle, distance
+            previous_angle, previous_distance, previous_turn = angle, distance, turn
         return allowed
 
     def drive(self, observation):
@@ -107,7 +116,13 @@ class HeuristicController(Agent):
         if traffic_ahead:
             side = -1 if bearing > 0 else 1                     # lato opposto all'auto davanti (+ = destra)
             room = distances[RIGHT_SIDE] if side > 0 else distances[LEFT_SIDE]
-            if room >= self.pass_room_px:
+            # Il sorpasso sposta il punto inseguito: solo dove la pista è quasi dritta. In una S sul tracciato
+            # aef0ebdd lo spostamento a metà curva mandava fuori 9 euristici su 20 (0 su 20 senza sorpasso).
+            # In una S la svolta netta su 150 px è quasi nulla: si guarda la svolta di ciascun tratto.
+            near_turn = self._angle(observation[OBS_TRACK_HEADING]) + heading_error
+            mid_turn = self._angle(observation[OBS_TRACK_HEADING + 1]) - self._angle(observation[OBS_TRACK_HEADING])
+            straight = max(abs(near_turn), abs(mid_turn), bend) < self.pass_max_bend_rad
+            if room >= self.pass_room_px and straight:
                 alpha += side * self.pass_bias_rad
             else:
                 following = True
